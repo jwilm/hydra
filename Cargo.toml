@@ -2,5 +2,7 @@
 name = "hydra"
 version = "0.1.0"
 authors = ["Joe Wilm <joe@jwilm.com>"]
+description = "Squatting"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
