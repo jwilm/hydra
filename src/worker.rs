@@ -13,6 +13,7 @@ use mio::tcp::TcpStream;
 use mio::util::Slab;
 use mio::{self, Token, EventSet, EventLoop};
 
+use protocol::{self, Protocol, Http2};
 use util::thread;
 
 /// Messages sent to the worker
@@ -21,7 +22,7 @@ enum Msg {
     CreatePlaintextConnection(TcpStream, Box<::ConnectionHandler>),
 
     /// Send a message to a client on this thread
-    ConnectionMsg(ConnectionMsg),
+    ConnectionMsg(protocol::Msg),
 
     /// Worker should stop creating new streams, finish processing active streams, and terminate.
     Terminate,
@@ -62,6 +63,14 @@ struct Connection {
     protocol: Http2,
     read_buf: Vec<u8>,
     handler: Box<ConnectionHandler>,
+}
+
+/// Information about a connection which may be relevant to consumers
+#[derive(Debug, Clone)]
+struct ConnectionInfo {
+    active_streams: Arc<AtomicUsize>,
+    queued_requests: Arc<AtomicUsize>,
+    max_concurrent_streams: Arc<AtomicUsize>,
 }
 
 /// The Worker lives on its own thread managing I/O for HTTP/2 requests.

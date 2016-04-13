@@ -21,8 +21,11 @@ pub use hyper::method::Method;
 pub use hyper::status::{StatusCode, StatusClass};
 pub use hyper::header::{self, Headers};
 
+use solicit::http::session;
+
 mod worker;
 mod util;
+mod protocol;
 
 use worker::Worker;
 
@@ -33,8 +36,20 @@ pub trait ConnectionHandler: Send + 'static {
 }
 
 pub trait RequestHandler: Send + 'static {
-    fn on_error(&self, err: RequestError);
-    fn on_response(&self, res: Response);
+    /// Provide data from the request body
+    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
+
+    /// Response headers are available
+    fn on_response_headers(&mut self, res: Headers);
+
+    /// Data from the response is available
+    fn on_response_data(&mut self, data: &[u8]);
+
+    /// Called when the stream is closed
+    fn on_close(&mut self);
+
+    /// Error occurred
+    fn on_error(&mut self, err: RequestError);
 }
 
 pub trait Connector: Send + 'static {}
@@ -129,20 +144,18 @@ impl<'a> Client<'a> {
 }
 
 pub struct Request {
-    _method: Method,
-    _path: String,
-    _body: Vec<u8>,
+    method: Method,
+    path: String,
 }
 
 impl Request {
-    pub fn new<P, B>(method: Method, path: P, body: B) -> Request
+    pub fn new<P, B>(method: Method, path: P) -> Request
         where P: Into<String>,
-              B: Into<Vec<u8>>,
     {
+        // TODO headers
         Request {
-            _method: method,
-            _path: path.into(),
-            _body: body.into(),
+            method: method,
+            path: path.into(),
         }
     }
 }

@@ -10,9 +10,11 @@ mio = "0.5"
 openssl = { version = "0.7.9", optional = true }
 hyper = { version = "0.8", default-features = false }
 log = "*"
+httparse = "*"
 
 [dependencies.solicit]
 version = "0.4"
+path = "../solicit"
 
 [features]
 tls = ["openssl"]
