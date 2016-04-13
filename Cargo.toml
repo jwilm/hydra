@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 mio = "0.5"
 openssl = { version = "0.7.9", optional = true }
 hyper = { version = "0.8", default-features = false }
+log = "*"
 
 [dependencies.solicit]
 version = "0.4"
