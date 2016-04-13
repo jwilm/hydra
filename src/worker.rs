@@ -22,7 +22,7 @@ enum Msg {
     CreatePlaintextConnection(TcpStream, Box<::ConnectionHandler>),
 
     /// Send a message to a client on this thread
-    ConnectionMsg(protocol::Msg),
+    ConnectionMsg(mio::Token, protocol::Msg),
 
     /// Worker should stop creating new streams, finish processing active streams, and terminate.
     Terminate,
@@ -31,7 +31,7 @@ enum Msg {
 /// Messages sent to a connection managed by the worker
 enum ConnectionMsg {
     SendPing,
-    NewRequest(::Request),
+    NewRequest(::Request, Box<ConnectionHandler>),
 }
 
 /// Notices wake up the worker event loop
@@ -65,12 +65,48 @@ struct Connection {
     handler: Box<ConnectionHandler>,
 }
 
-/// Information about a connection which may be relevant to consumers
+/// A projection of the Connection type for use within the worker thread.
+struct ConnectionRef<'a> {
+    token: Token,
+    backlog: &'a mut Vec<Cursor<Vec<u8>>>,
+    is_writable: bool,
+}
+
+/// Handle for a connection usable from other threads
+///
+/// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection.
 #[derive(Debug, Clone)]
-struct ConnectionInfo {
+struct ConnectionHandle {
+    /// How many streams are currently active.
     active_streams: Arc<AtomicUsize>,
+
+    /// Number of requests queued in the connection
+    ///
+    /// Should only be nonzero when active_streams matches max_concurrent_streams.
     queued_requests: Arc<AtomicUsize>,
-    max_concurrent_streams: Arc<AtomicUsize>,
+
+    /// How many active streams the connection may have
+    ///
+    /// This is determined when the initial SETTINGS frame is received.
+    max_concurrent_streams: u32,
+
+    /// Sender to event loop where connection is running.
+    tx: mio::Sender,
+
+    /// Token for the connection on its corresponding thread
+    token: mio::Token,
+}
+
+impl ConnectionHandle {
+    fn send(msg: ConnectionMsg) {
+        self.tx.send(Msg::ConnectionMsg(self.token, msg));
+    }
+
+    fn request<H>(req: ::Request, handler: H)
+        where H: ConnectionHandler
+    {
+        self.send(Connection::NewRequest(req, Box::new(handler)));
+    }
 }
 
 /// The Worker lives on its own thread managing I/O for HTTP/2 requests.
@@ -207,8 +243,10 @@ impl Worker {
                       stream: TcpStream,
                       handler: Box<ConnectionHandler>)
     {
-        let token = self.connections.insert_with(|token| {
+        self.connections.insert_with(|token| {
             // TODO create a connection
+            let conn = Connection::new(token, stream, handler);
+            conn
         });
     }
 

@@ -15,10 +15,10 @@ use httparse;
 pub trait Protocol: Sized + 'static {
     type Message: Send + ::std::fmt::Debug;
 
-    fn new(conn: ConnectionHandle<Self>) -> Self;
-    fn on_data(&mut self, buf: &[u8], conn: ConnectionRef<Self>) -> Result<usize, ()>;
-    fn ready_write(&mut self, conn: ConnectionRef<Self>);
-    fn notify(&mut self, msg: Self::Message, conn: ConnectionRef<Self>);
+    fn new() -> Self;
+    fn on_data(&mut self, buf: &[u8], conn: ConnectionRef) -> Result<usize, ()>;
+    fn ready_write(&mut self, conn: ConnectionRef);
+    fn notify(&mut self, msg: Self::Message, conn: ConnectionRef);
 }
 
 /// Messages for an HTTP/2 state machine
@@ -101,8 +101,17 @@ impl<'a> ReceiveFrame for WrappedReceive<'a> {
 }
 
 struct Stream {
-    state: session::SessionState,
+    state: session::StreamState,
     inner: Box<RequestHandler>,
+}
+
+impl Stream {
+    pub fn new(handler: Box<RequestHandler>) -> Stream {
+        Stream {
+            state: session::StreamState::Open,
+            inner: handler,
+        }
+    }
 }
 
 impl session::Stream for Stream {
@@ -144,6 +153,7 @@ impl session::Stream for Stream {
 
 pub struct Http2 {
     init: bool,
+    got_settings: bool,
     conn: HttpConnection,
     state: DefaultSessionState<ClientMarker, BoxStream>,
 
@@ -151,10 +161,13 @@ pub struct Http2 {
     settings: Http2Settings,
 }
 
+/// Settings type that exposes some properties via Send/Sync types
 pub struct Http2Settings {
-    /// 
-    shared_max_concurrent_streams: Arc<AtomicUsize>
-    max_concurrent_streams: usize
+    /// The connection ref held by consumers needs knowledge of max_concurrent streams
+    shared_max_concurrent_streams: Arc<AtomicUsize>,
+
+    /// Max concurrent streams for local use
+    max_concurrent_streams: u32
 }
 
 impl Http2Settings {
@@ -163,9 +176,11 @@ impl Http2Settings {
             max_concurrent_streams: max_concurrent_streams,
         }
     }
+}
 
+impl Settings for Http2Settings {
     pub fn set_max_concurrent_streams(&mut self, val: u32) {
-        self.max_concurrent_streams.store(val as usize, 
+        self.shared_max_concurrent_streams.store(val as usize, Ordering::SeqCst);
         self.max_concurrent_streams = val;
     }
 }
@@ -201,7 +216,7 @@ impl Http2 {
 
         RequestStream {
             headers: headers,
-            stream: Stream { inner: handler },
+            stream: Stream::new(handler),
         }
     }
 
@@ -240,6 +255,7 @@ impl Http2 {
         let stream_id = self.state.insert_outgoing(req.stream);
         try!(self.conn.sender(sender).send_headers(req.headers, stream_id, end_stream));
 
+        debug!("CreatedStream {:?}", stream_id);
         Ok(stream_id)
     }
 
@@ -273,6 +289,14 @@ impl Http2 {
         let mut prioritizer = SimplePrioritizer::new(&mut self.state, &mut buf);
         self.conn.sender(sender).send_next_data(&mut prioritizer)
     }
+
+    fn initialize(&mut self) {
+        // Write preface
+        let mut buf = Vec::new();
+        write_preface(&mut buf).unwrap();
+        conn.queue_frame(buf);
+        self.init = true;
+    }
 }
 
 impl Protocol for Http2 {
@@ -289,7 +313,7 @@ impl Protocol for Http2 {
         }
     }
 
-    fn on_data<'a>(&mut self, buf: &[u8], mut conn: ConnectionRef<Http2>) -> Result<usize, ()> {
+    fn on_data<'a>(&mut self, buf: &[u8], mut conn: ConnectionRef) -> Result<usize, ()> {
         trace!("Http2: Received something back");
         let mut total_consumed = 0;
         loop {
@@ -308,6 +332,11 @@ impl Protocol for Http2 {
                     let len = receiver.frame().unwrap().len();
                     debug!("Handling an HTTP/2 frame of total size {}", len);
                     let mut sender = SendDirect { conn: &mut conn };
+                    if !self.got_settings {
+                        try!(self.expect_settings(&mut receiver, &mut sender).map_err(|_| ()));
+                        self.got_settings = true;
+                        conn.connection_ready();
+                    }
                     try!(self.handle_next_frame(&mut receiver, &mut sender).map_err(|_| ()));
                     total_consumed += len;
                 },
@@ -325,11 +354,7 @@ impl Protocol for Http2 {
         // perhaps even asynchronously.
         trace!("Hello, from HTTP2");
         if !self.init {
-            // Write preface
-            let mut buf = Vec::new();
-            write_preface(&mut buf).unwrap();
-            conn.queue_frame(buf);
-            self.init = true;
+            self.initialize();
         } else {
             let mut sender = SendDirect { conn: &mut conn };
             self.send_next_data(&mut sender);
@@ -338,26 +363,16 @@ impl Protocol for Http2 {
 
     fn notify(&mut self, msg: Msg, mut conn: ConnectionRef<Http2>) {
         trace!("Http2 notified: msg={:?}", msg);
+
         if !self.init {
-            // Write preface
-            let mut buf = Vec::new();
-            write_preface(&mut buf).unwrap();
-            conn.queue_frame(buf);
-            self.init = true;
+            self.initialize();
         }
+
         match msg {
             Msg::CreateStream(request, handler) => {
-                debug!("Also sending a request");
                 let stream = self.new_stream(request, handler);
                 let mut sender = SendDirect { conn: &mut conn };
-                let id = self.start_request(stream, &mut sender).unwrap();
-                // TODO Ewww!
-                self.conn.state.get_stream_mut(id).unwrap().inner.started(id);
-
-        let stream_id = self.state.insert_outgoing(req.stream);
-        try!(self.conn.sender(sender).send_headers(req.headers, stream_id, end_stream));
-
-        Ok(stream_id)
+                self.start_request(stream, &mut sender);
             },
         }
     }
@@ -373,62 +388,6 @@ impl ::std::fmt::Debug for HttpMsg {
     }
 }
 
-// The client end of the stream. Allows them to queue data for writing and handle data that was
-// meant for that stream.
-// pub struct Stream {
-//     tx: mpsc::Sender<Vec<u8>>,
-//     rx: mpsc::Receiver<Vec<u8>>,
-// }
-// 
-// impl Stream {
-//     fn new(tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>) -> Stream {
-//         Stream {
-//             tx: tx,
-//             rx: rx,
-//         }
-//     }
-// 
-//     pub fn write<B: Into<Vec<u8>>>(&self, buf: B) {
-//         self.tx.send(buf.into()).unwrap();
-//     }
-// 
-//     pub fn recv_chunk(&self) -> Result<Vec<u8>, ()> {
-//         self.rx.recv().map_err(|_| ())
-//     }
-// }
-// The protocol-end of the stream; this one should impl solicit::Stream
-// struct ProtoStream {
-//     rx: mpsc::Receiver<Vec<u8>>,
-//     tx: mpsc::Sender<Vec<u8>>,
-// }
-// 
-// impl ProtoStream {
-//     fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>) -> ProtoStream {
-//         ProtoStream {
-//             rx: rx,
-//             tx: tx,
-//         }
-//     }
-// }
-
-/*
-impl session::Stream for ProtoStream {
-    fn new(stream_id: StreamId) -> Self {
-
-    }
-    fn new_data_chunk(&mut self, data: &[u8]);
-    fn set_headers(&mut self, headers: Vec<Header>);
-    fn set_state(&mut self, state: StreamState);
-
-    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
-
-    /// Returns the ID of the stream.
-    fn id(&self) -> StreamId;
-    /// Returns the current state of the stream.
-    fn state(&self) -> StreamState;
-}
-*/
-
 /// An implementation of the `Session` trait which wraps the Http2 protocol object
 ///
 /// While handling the events signaled by the `HttpConnection`, the struct will modify the given
@@ -442,25 +401,26 @@ impl session::Stream for ProtoStream {
 /// a client that streams responses directly into a file on the local file system,
 /// instead of keeping it in memory (like the `DefaultStream` does), without
 /// having to change any HTTP/2-specific logic.
-struct ClientSession<'a, State, S>
+struct ClientSession<'a, State, G, S>
     where State: session::SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          G: Settings + 'a
 {
     state: &'a mut State,
     sender: &'a mut S,
-    settings: &'a mut Http2Settings,
+    settings: &'a mut G,
 }
 
-impl<'a, State, S> ClientSession<'a, State, S>
+impl<'a, State, G, S> ClientSession<'a, State, G, S>
     where State: session::SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          G: Settings + 'a,
 {
     /// Returns a new `ClientSession` associated to the given state.
     #[inline]
     pub fn new(state: &'a mut State,
                sender: &'a mut S,
-               // TODO settings should maybe be a trait
-               settings: &'a mut Http2Settings) -> ClientSession<'a, State, S>
+               settings: &'a mut G) -> ClientSession<'a, State, G, S>
     {
         ClientSession {
             state: state,
@@ -470,15 +430,17 @@ impl<'a, State, S> ClientSession<'a, State, S>
     }
 }
 
-impl<'a, State, S> Session for ClientSession<'a, State, S>
+impl<'a, State, G, S> Session for ClientSession<'a, State, G, S>
     where State: session::SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          G: Settings + 'a,
 {
     fn new_data_chunk(&mut self,
                       stream_id: StreamId,
                       data: &[u8],
                       _: &mut HttpConnection)
-                      -> HttpResult<()> {
+                      -> HttpResult<()>
+    {
         debug!("Data chunk for stream {}", stream_id);
         let mut stream = match self.state.get_stream_mut(stream_id) {
             None => {
@@ -498,8 +460,8 @@ impl<'a, State, S> Session for ClientSession<'a, State, S>
     fn new_headers<'n, 'v>(&mut self,
                            stream_id: StreamId,
                            headers: Vec<Header<'n, 'v>>,
-                           _conn: &mut HttpConnection)
-                           -> HttpResult<()> {
+                           _conn: &mut HttpConnection) -> HttpResult<()>
+    {
         debug!("Headers for stream {}", stream_id);
         let mut stream = match self.state.get_stream_mut(stream_id) {
             None => {
@@ -534,8 +496,8 @@ impl<'a, State, S> Session for ClientSession<'a, State, S>
     fn rst_stream(&mut self,
                   stream_id: StreamId,
                   error_code: ErrorCode,
-                  _: &mut HttpConnection)
-                  -> HttpResult<()> {
+                  _: &mut HttpConnection) -> HttpResult<()>
+    {
         debug!("RST_STREAM id={:?}, error={:?}", stream_id, error_code);
         self.state.get_stream_mut(stream_id).map(|stream| stream.on_rst_stream(error_code));
         Ok(())
@@ -543,8 +505,8 @@ impl<'a, State, S> Session for ClientSession<'a, State, S>
 
     fn new_settings(&mut self,
                     settings: Vec<HttpSetting>,
-                    conn: &mut HttpConnection)
-                    -> HttpResult<()> {
+                    conn: &mut HttpConnection) -> HttpResult<()>
+    {
         debug!("Sending a SETTINGS ack");
 
         for setting in &settings {
