@@ -3,6 +3,7 @@
 extern crate mio;
 extern crate solicit;
 extern crate hyper;
+extern crate httparse;
 
 #[macro_use]
 extern crate log;
@@ -11,10 +12,11 @@ extern crate log;
 extern crate openssl;
 
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::Cell;
-use std::net::{self, SocketAddr};
+use std::net::{self, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
+use std::io::Result;
 
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
@@ -29,27 +31,12 @@ pub mod protocol;
 
 use worker::Worker;
 
+pub use protocol::StreamHandler;
+
 pub trait ConnectionHandler: Send + 'static {
     fn on_connection(&self, worker::ConnectionHandle);
     fn on_error(&self, ConnectionError);
     fn on_pong(&self);
-}
-
-pub trait RequestHandler: Send + 'static {
-    /// Provide data from the request body
-    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
-
-    /// Response headers are available
-    fn on_response_headers(&mut self, res: Headers);
-
-    /// Data from the response is available
-    fn on_response_data(&mut self, data: &[u8]);
-
-    /// Called when the stream is closed
-    fn on_close(&mut self);
-
-    /// Error occurred
-    fn on_error(&mut self, err: RequestError);
 }
 
 pub trait Connector: Send + 'static {}
@@ -76,6 +63,26 @@ impl Default for Config {
     }
 }
 
+/// Run F for each addr
+///
+/// Does synchronous DNS lookup with getaddrinfo. This function was ripped from the stb library
+/// (it's private).
+fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
+    where F: FnMut(&SocketAddr) -> io::Result<T>
+{
+    let mut last_err = None;
+    for addr in try!(addr.to_socket_addrs()) {
+        match f(&addr) {
+            Ok(l) => return Ok(l),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        Error::new(ErrorKind::InvalidInput,
+                   "could not resolve to any addresses")
+    }))
+}
+
 /// Interface to evented HTTP/2 client worker pool
 pub struct Hydra {
     workers: Vec<worker::Handle>,
@@ -98,20 +105,18 @@ impl Hydra {
     /// Connect to a host on plaintext transport
     ///
     /// FIXME U should be ToSocketAddrs
-    pub fn connect<'a, U, H>(&'a self, host: U, handler: H) -> ConnectionResult<Client<'a>, Error>
-        where U: AsRef<str>,
+    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<Client<'a>, Error>
+        where U: ToSocketAddrs,
               H: ConnectionHandler,
     {
         // Parse the host param as a socket address
-        let addr = try!(ParseSocketAddr(host.as_ref()));
-        let stream = try!(mio::tcp::TcpStream::connect(&addr));
+        let stream = try!(each_addr(addr, mio::tcp::TcpStream::connect));
 
         let next = self.next.fetch_add(1, Ordering::SeqCst);
-        let worker = workers[next * workers.len()];
+        let worker = self.workers[next * self.workers.len()];
         let pending_connection = worker.connect(stream, Box::new(handler));
 
-        // mio::tcp::TcpStream::connect
-        unimplemented!();
+        worker.connect(stream, Box::new(handler));
     }
 
     #[cfg(feature = "tls")]
@@ -146,6 +151,7 @@ impl<'a> Client<'a> {
 pub struct Request {
     method: Method,
     path: String,
+    headers_only: bool,
 }
 
 impl Request {
@@ -156,6 +162,18 @@ impl Request {
         Request {
             method: method,
             path: path.into(),
+            headers_only: false,
+        }
+    }
+
+    pub fn new<P, B>(method: Method, path: P) -> Request
+        where P: Into<String>,
+    {
+        // TODO headers
+        Request {
+            method: method,
+            path: path.into(),
+            headers_only: true,
         }
     }
 }

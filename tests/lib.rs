@@ -36,10 +36,10 @@ impl hydra::ConnectionHandler for ConnectHandler {
     }
 }
 
-fn response_collector() -> (RequestHandler, ResponseCollector) {
+fn response_collector() -> (StreamHandler, ResponseCollector) {
     let (tx, rx) = mpsc::channel();
     let counter = Arc::new(AtomicUsize::new(1));
-    let handler = RequestHandler::new(tx, counter.clone());
+    let handler = StreamHandler::new(tx, counter.clone());
     let collector = ResponseCollector::new(rx, counter);
 
     (handler, collector)
@@ -65,30 +65,30 @@ impl ResponseCollector {
     }
 }
 
-struct RequestHandler {
+struct StreamHandler {
     tx: mpsc::Sender<Option<hydra::Response>>,
     counter: Arc<AtomicUsize>,
 }
 
-impl Clone for RequestHandler {
-    fn clone(&self) -> RequestHandler {
+impl Clone for StreamHandler {
+    fn clone(&self) -> StreamHandler {
         self.counter.fetch_add(1, Ordering::SeqCst);
-        RequestHandler {
+        StreamHandler {
             tx: self.tx.clone(),
             counter: self.counter.clone(),
         }
     }
 }
 
-impl RequestHandler {
+impl StreamHandler {
     pub fn new(tx: mpsc::Sender<Option<hydra::Response>>,
-               counter: Arc<AtomicUsize>) -> RequestHandler
+               counter: Arc<AtomicUsize>) -> StreamHandler
     {
-        RequestHandler { tx: tx, counter: counter, }
+        StreamHandler { tx: tx, counter: counter, }
     }
 }
 
-impl hydra::RequestHandler for RequestHandler {
+impl hydra::StreamHandler for StreamHandler {
     fn on_error(&self, _err: hydra::RequestError) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
         self.tx.send(None).unwrap();

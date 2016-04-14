@@ -21,16 +21,10 @@ enum Msg {
     CreatePlaintextConnection(TcpStream, Box<::ConnectionHandler>),
 
     /// Send a message to a client on this thread
-    ConnectionMsg(mio::Token, protocol::Msg),
+    Protocol(mio::Token, protocol::Msg),
 
     /// Worker should stop creating new streams, finish processing active streams, and terminate.
     Terminate,
-}
-
-/// Messages sent to a connection managed by the worker
-enum ConnectionMsg {
-    SendPing,
-    NewRequest(::Request, Box<ConnectionHandler>),
 }
 
 /// Notices wake up the worker event loop
@@ -84,6 +78,10 @@ struct ConnectionRef<'a> {
 #[derive(Debug, Clone)]
 pub struct ConnectionHandle {
     // How many streams are currently active.
+    //
+    // This value is exposed to the client so they can hold on to the handle as long as there are
+    // still requests active. Hmm. Maybe the event loop should just be smart enough to not close
+    // while there's still activity?
     // active_streams: Arc<AtomicUsize>,
 
     // Number of requests queued in the connection
@@ -91,27 +89,22 @@ pub struct ConnectionHandle {
     // Should only be nonzero when active_streams matches max_concurrent_streams.
     // queued_requests: Arc<AtomicUsize>,
 
-    // How many active streams the connection may have
-    //
-    // This is determined when the initial SETTINGS frame is received.
-    // max_concurrent_streams: u32,
-
     /// Sender to event loop where connection is running.
-    tx: mio::Sender,
+    tx: mio::Sender<Msg>,
 
     /// Token for the connection on its corresponding thread
     token: mio::Token,
 }
 
 impl ConnectionHandle {
-    fn send(msg: ConnectionMsg) {
-        self.tx.send(Msg::ConnectionMsg(self.token, msg));
+    fn send(msg: protocol::Msg) {
+        self.tx.send(Msg::Protocol(self.token, msg));
     }
 
     fn request<H>(req: ::Request, handler: H)
         where H: ConnectionHandler
     {
-        self.send(Connection::NewRequest(req, Box::new(handler)));
+        self.send(protocol::Msg::CreateStream(req, Box::new(handler)));
     }
 }
 
@@ -146,7 +139,7 @@ pub struct Handle {
     tx: mpsc::Sender<Msg>,
 
     /// Notifier handle for the worker's event loop.
-    notifier: mio::Sender<Notice>,
+    notifier: mio::Sender<Msg>,
 
     /// Handle to the worker thread.
     ///
@@ -272,8 +265,8 @@ impl Worker {
                             self.add_connection(event_loop, stream, handler);
                         }
                     },
-                    Msg::ConnectionMsg(ref connection_msg) => {
-                        self.connections[token].notify(event_loop, connection_msg);
+                    Msg::Protocol(ref protocol_msg) => {
+                        self.connections[token].notify(event_loop, protocol_msg);
                     },
                     Msg::Terminate => {
                         if !self.closing {
@@ -358,32 +351,19 @@ impl Connection {
         }
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: Message<P::Message>) {
+    fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
         trace!("Connection notified: token={:?}; msg={:?}", self.token, msg);
-        match msg {
-            Message::Hello => {
-                trace!("Hi there yourself!");
-            },
-            Message::TryWrite => {
-                trace!("Aye, aye! Will try to write something");
-                self.try_write(event_loop).ok().unwrap();
-            },
-            Message::QueueFrame(frame) => {
-                self.queue_frame(frame);
-                self.try_write(event_loop).ok().unwrap();
-            },
-            Message::Proto(msg) => {
-                let conn_ref = ConnectionRef {
-                    event_loop: event_loop,
-                    backlog: &mut self.backlog,
-                    handle: ConnectionHandle::new(
-                        DispatcherHandle::new_for_loop(event_loop),
-                        self.token),
-                    writable: self.is_writable,
-                };
-                self.protocol.notify(msg, conn_ref);
-            }
+
+        let conn_ref = ConnectionRef {
+            event_loop: event_loop,
+            backlog: &mut self.backlog,
+            handle: ConnectionHandle::new(
+                DispatcherHandle::new_for_loop(event_loop),
+                self.token),
+            writable: self.is_writable,
         };
+
+        self.protocol.notify(msg, conn);
     }
 
     fn read(&mut self, event_loop: &mut EventLoop<Worker>) {

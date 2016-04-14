@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{Cursor, Read};
 
 use solicit::http::frame::{Frame, RawFrame, FrameIR, HttpSetting};
@@ -8,13 +8,29 @@ use solicit::http::{HttpScheme, HttpResult, Header, StreamId};
 use solicit::http::connection::{HttpConnection, SendFrame, ReceiveFrame, HttpFrame};
 use solicit::http::client::{write_preface, ClientConnection, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
-use solicit::http::session::{self, StreamDataChunk, StreamDataError, Client as ClientMarker};
+use solicit::http::session::{self, StreamDataChunk, StreamDataError};
 
 use httparse;
 
-pub trait Protocol: Sized + 'static {
-    type Message: Send + ::std::fmt::Debug;
+/// Stream events and Request/Response bytes are delivered to/from the handler.
+pub trait StreamHandler: Send + 'static {
+    /// Provide data from the request body
+    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
 
+    /// Response headers are available
+    fn on_response_headers(&mut self, res: Headers);
+
+    /// Data from the response is available
+    fn on_response_data(&mut self, data: &[u8]);
+
+    /// Called when the stream is closed
+    fn on_close(&mut self);
+
+    /// Error occurred
+    fn on_error(&mut self, err: RequestError);
+}
+
+pub trait Protocol: Sized + 'static {
     fn new() -> Self;
     fn on_data(&mut self, buf: &[u8], conn: ConnectionRef) -> Result<usize, ()>;
     fn ready_write(&mut self, conn: ConnectionRef);
@@ -23,41 +39,11 @@ pub trait Protocol: Sized + 'static {
 
 /// Messages for an HTTP/2 state machine
 pub enum Msg {
-    CreateStream(::Request, Box<RequestHandler>),
+    CreateStream(::Request, Box<StreamHandler>),
     Ping,
 }
 
-struct FakeSend;
-impl SendFrame for FakeSend {
-    #[inline]
-    fn send_frame<F: FrameIR>(&mut self, frame: F) -> HttpResult<()> {
-        trace!("FakeSend::send_frame");
-        Ok(())
-    }
-}
-
-// TODO Replace with a send-the-short-way once `solicit` allows us to!
-//      It's the long way because even though the HttpConnection at the point when it uses the
-//      SendFrame methods is executing within the event loop (and thus has exclusive ownership of
-//      everything), we still send a QueueFrame message to the loop instead of directly invoking
-//      the equivalent functionality on the ConnectionRef.
-//      Solicit needs to facilitate this by changing the HttpConnection API to not require an
-//      owned SendFrame instance, but only one that it gets from the session layer in its
-//      handle/send methods (similar to how the session delegate/callbacks are passed).
-struct SendLongWay {
-    handle: ConnectionHandle<Http2>,
-}
-impl SendFrame for SendLongWay {
-    #[inline]
-    fn send_frame<F: FrameIR>(&mut self, frame: F) -> HttpResult<()> {
-        trace!("SendLongWay::send_raw_frame");
-        let mut buf = Cursor::new(Vec::with_capacity(1024));
-        try!(frame.serialize_into(&mut buf));
-        self.handle.notify(Message::QueueFrame(buf.into_inner()));
-        Ok(())
-    }
-}
-
+/// SendFrame implementor that pushes onto the connection outgoing frame list.
 struct SendDirect<'brw, 'conn> where 'conn: 'brw {
     conn: &'brw mut ConnectionRef<'conn, Http2>,
 }
@@ -71,44 +57,58 @@ impl<'a, 'b> SendFrame for SendDirect<'a, 'b> {
     }
 }
 
-struct FakeReceive;
-impl ReceiveFrame for FakeReceive {
-    fn recv_frame(&mut self) -> HttpResult<HttpFrame> {
-        panic!("Should never have been called!");
-    }
-}
-
+/// Receiver that will yield precisely one frame
+///
+/// If a WrapperReceive can be successfully constructed from `parse`, `recv_frame` may be used to
+/// consume the RawFrame. Since HttpFrame::from_raw requires an owned RawFrame, it is held in an
+/// option to be moved at some point.
 struct WrappedReceive<'a> {
     frame: Option<RawFrame<'a>>,
 }
 
 impl<'a> WrappedReceive<'a> {
+    /// Attempts to read an entire frame from the transport read buffer.
+    ///
+    /// In the case where not enough bytes are available to construct a RawFrame, parse returns
+    /// None.
     fn parse(buf: &'a [u8]) -> Option<WrappedReceive<'a>> {
         RawFrame::parse(buf).map(|frame| WrappedReceive {
             frame: Some(frame),
         })
     }
-    pub fn frame(&self) -> Option<&RawFrame<'a>> { self.frame.as_ref() }
+
+    pub fn frame(&self) -> Option<&RawFrame<'a>> {
+        self.frame.as_ref()
+    }
 }
+
 impl<'a> ReceiveFrame for WrappedReceive<'a> {
+    /// Take the wrapped frame and parse it
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once for a given WrappedReceive instance
+    ///
+    /// # TODO
+    ///
+    /// HttpFrame should also allow for borrowed frame buffers. As it stands, at this point we have
+    /// to make a copy!!! This is not the fault of the ReceiveFrame abstraction, though. The same
+    /// would happen if the HttpConn itself parsed a raw buffer into a frame, since it'd need to
+    /// create an HttpFrame at some point in order to correspondingly handle it...
     fn recv_frame(&mut self) -> HttpResult<HttpFrame> {
-        // TODO HttpFrame should also allow for borrowed frame buffers. As it stands, at this point
-        //      we have to make a copy!!! This is not the fault of the ReceiveFrame abstraction,
-        //      though. The same would happen if the HttpConn itself parsed a raw buffer into a
-        //      frame, since it'd need to create an HttpFrame at some point in order to
-        //      correspondingly handle it...
-        HttpFrame::from_raw(self.frame.as_ref().unwrap())
+        HttpFrame::from_raw(self.frame.take().unwrap())
     }
 }
 
 struct Stream {
     state: session::StreamState,
-    inner: Box<RequestHandler>,
+    inner: Box<StreamHandler>,
 }
 
 impl Stream {
-    pub fn new(handler: Box<RequestHandler>) -> Stream {
+    pub fn new(handler: Box<StreamHandler>) -> Stream {
         Stream {
+            // TODO should really start in Idle state
             state: session::StreamState::Open,
             inner: handler,
         }
@@ -156,7 +156,7 @@ pub struct Http2 {
     init: bool,
     got_settings: bool,
     conn: HttpConnection,
-    state: DefaultSessionState<ClientMarker, BoxStream>,
+    state: DefaultSessionState<BoxStream>,
 
     /// Dynamic protocol configuration
     settings: Http2Settings,
@@ -164,24 +164,20 @@ pub struct Http2 {
 
 /// Settings type that exposes some properties via Send/Sync types
 pub struct Http2Settings {
-    /// The connection ref held by consumers needs knowledge of max_concurrent streams
-    shared_max_concurrent_streams: Arc<AtomicUsize>,
-
     /// Max concurrent streams for local use
     max_concurrent_streams: u32
 }
 
-impl Http2Settings {
-    pub fn new(max_concurrent_streams: Arc<AtomicUsize>) -> Self {
+impl Default for Http2Settings {
+    fn default() -> Self {
         Http2Settings {
-            max_concurrent_streams: max_concurrent_streams,
+            max_concurrent_streams: 10,
         }
     }
 }
 
 impl Settings for Http2Settings {
     pub fn set_max_concurrent_streams(&mut self, val: u32) {
-        self.shared_max_concurrent_streams.store(val as usize, Ordering::SeqCst);
         self.max_concurrent_streams = val;
     }
 }
@@ -196,24 +192,25 @@ trait Settings {
 }
 
 impl Http2 {
-    fn new_stream(&mut self,
-                  request: ::Request,
-                  handler: Box<RequestHandler>) -> RequestStream<BoxStream>
-    {
-        // TODO Set ID
-        // TODO Figure out when to locally close streams that have no data in order to send just
-        //      the headers with a request...
-        //
-
-        let ::Request { method, path } = request;
+    /// Create a RequestStream given a request and handler
+    ///
+    /// This is a convenience method for generating a RequestStream. It is not added to the
+    /// protocol's active streams; that is up to the caller.
+    fn new_stream(request: ::Request, handler: Box<StreamHandler>) -> RequestStream<BoxStream> {
+        let ::Request { method, path, headers_only } = request;
 
         // TODO hyper headers
         let mut headers: Vec<Header> = vec![
-            Header::new(b":method", format!(method).into_bytes()),
+            Header::new(b":method", format!("{}", method).into_bytes()),
             Header::new(b":path", path.into_bytes()),
             Header::new(b":authority", &b"http2bin.org"[..]),
             Header::new(b":scheme", self.conn.scheme().as_bytes().to_vec()),
         ];
+
+        let stream = Stream::new(handler);
+        if headers_only {
+            stream.set_state(StreamState::HalfClosedLocal);
+        }
 
         RequestStream {
             headers: headers,
@@ -245,14 +242,16 @@ impl Http2 {
     ///
     /// For now it does not perform any validation whether the given `RequestStream` is valid.
     pub fn start_request<S: SendFrame>(&mut self,
-                                       req: RequestStream<State::Stream>,
+                                       mut req: RequestStream<State::Stream>,
                                        sender: &mut S)
                                        -> HttpResult<StreamId> {
+
         let end_stream = if req.stream.is_closed_local() {
             EndStream::Yes
         } else {
             EndStream::No
         };
+
         let stream_id = self.state.insert_outgoing(req.stream);
         try!(self.conn.sender(sender).send_headers(req.headers, stream_id, end_stream));
 
@@ -301,8 +300,6 @@ impl Http2 {
 }
 
 impl Protocol for Http2 {
-    type Message = HttpMsg;
-
     fn new() -> Http2 {
         let raw_conn = HttpConnection::new(HttpScheme::Http);
         let state = session::default_client_state();
@@ -330,7 +327,7 @@ impl Protocol for Http2 {
                     break;
                 },
                 Some(mut receiver) => {
-                    let len = receiver.frame().unwrap().len();
+                    let len = receiver.frame().len();
                     debug!("Handling an HTTP/2 frame of total size {}", len);
 
                     let mut sender = SendDirect { conn: &mut conn };
@@ -368,7 +365,7 @@ impl Protocol for Http2 {
         }
     }
 
-    fn notify(&mut self, msg: Msg, mut conn: ConnectionRef<Http2>) {
+    fn notify(&mut self, msg: Msg, mut conn: ConnectionRef) {
         trace!("Http2 notified: msg={:?}", msg);
 
         if !self.init {
@@ -377,7 +374,7 @@ impl Protocol for Http2 {
 
         match msg {
             Msg::CreateStream(request, handler) => {
-                let stream = self.new_stream(request, handler);
+                let stream = Http2::new_stream(request, handler);
                 let mut sender = SendDirect { conn: &mut conn };
                 self.start_request(stream, &mut sender);
             },
@@ -387,12 +384,6 @@ impl Protocol for Http2 {
 
 pub trait RequestDelegate: session::Stream {
     fn started(&mut self, stream_id: StreamId);
-}
-
-impl ::std::fmt::Debug for HttpMsg {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> Result<(), ::std::fmt::Error> {
-        f.debug_struct("HttpMsg").finish()
-    }
 }
 
 /// An implementation of the `Session` trait which wraps the Http2 protocol object
@@ -437,7 +428,7 @@ impl<'a, State, G, S> ClientSession<'a, State, G, S>
     }
 }
 
-impl<'a, State, G, S> Session for ClientSession<'a, State, G, S>
+impl<'a, State, G, S> session::Session for ClientSession<'a, State, G, S>
     where State: session::SessionState + 'a,
           S: SendFrame + 'a,
           G: Settings + 'a,
