@@ -8,7 +8,7 @@ use hydra::{Method, Request, Hydra};
 
 enum ConnectionMsg {
     Error(hydra::ConnectionError),
-    Connected,
+    Connected(hydra::worker::ConnectionHandle),
     Pong
 }
 
@@ -23,8 +23,8 @@ impl ConnectHandler {
 }
 
 impl hydra::ConnectionHandler for ConnectHandler {
-    fn on_connection(&self) {
-        self.tx.send(ConnectionMsg::Connected).unwrap();
+    fn on_connection(&self, connection: hydra::worker::ConnectionHandle) {
+        self.tx.send(ConnectionMsg::Connected(connection)).unwrap();
     }
 
     fn on_error(&self, err: hydra::ConnectionError) {
@@ -109,13 +109,13 @@ fn send_request() {
     let handler = ConnectHandler::new(tx);
 
     let cluster = Hydra::new(&config);
-    let client = cluster.connect("http://http2bin.org", handler);
+    cluster.connect("http://http2bin.org", handler);
 
     // Wait for the connection.
-    match rx.recv().unwrap() {
-        ConnectionMsg::Connected => (),
+    let client = match rx.recv().unwrap() {
+        ConnectionMsg::Connected(conn) => conn,
         _ => panic!("Didn't recv Connected"),
-    }
+    };
 
     let (req_handler, collector) = response_collector();
 

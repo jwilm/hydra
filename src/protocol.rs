@@ -61,6 +61,7 @@ impl SendFrame for SendLongWay {
 struct SendDirect<'brw, 'conn> where 'conn: 'brw {
     conn: &'brw mut ConnectionRef<'conn, Http2>,
 }
+
 impl<'a, 'b> SendFrame for SendDirect<'a, 'b> {
     fn send_frame<F: FrameIR>(&mut self, frame: F) -> HttpResult<()> {
         let mut buf = Cursor::new(Vec::with_capacity(1024));
@@ -326,22 +327,28 @@ impl Protocol for Http2 {
                         info!("Got response!");
                     }
 
-                    return Ok(total_consumed);
+                    break;
                 },
                 Some(mut receiver) => {
                     let len = receiver.frame().unwrap().len();
                     debug!("Handling an HTTP/2 frame of total size {}", len);
+
                     let mut sender = SendDirect { conn: &mut conn };
+
                     if !self.got_settings {
                         try!(self.expect_settings(&mut receiver, &mut sender).map_err(|_| ()));
                         self.got_settings = true;
                         conn.connection_ready();
+                    } else {
+                        try!(self.handle_next_frame(&mut receiver, &mut sender).map_err(|_| ()));
                     }
-                    try!(self.handle_next_frame(&mut receiver, &mut sender).map_err(|_| ()));
+
                     total_consumed += len;
                 },
             }
         }
+
+        Ok(total_consumed)
     }
 
     fn ready_write(&mut self, mut conn: ConnectionRef<Http2>) {

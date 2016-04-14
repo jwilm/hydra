@@ -2,7 +2,6 @@
 //!
 //! Workers contain a mio event loop, per connection HTTP/2 state (stream management, flow control,
 //! etc), and a state object accessible from the handle.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -45,6 +44,11 @@ enum Timeout {
     Connect(Token),
 }
 
+pub trait DispatchConnectionEvent {
+    fn on_connection(&self);
+    fn on_pong(&self);
+}
+
 /// Contains state relevant for managing a worker.
 pub struct Info {
     /// Number of active worker connections
@@ -67,8 +71,10 @@ struct Connection {
 
 /// A projection of the Connection type for use within the worker thread.
 struct ConnectionRef<'a> {
-    token: Token,
     backlog: &'a mut Vec<Cursor<Vec<u8>>>,
+    handler: &'a ConnectionHandler,
+    event_loop: &'a mut EventLoop<Worker>,
+    token: Token,
     is_writable: bool,
 }
 
@@ -76,19 +82,19 @@ struct ConnectionRef<'a> {
 ///
 /// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection.
 #[derive(Debug, Clone)]
-struct ConnectionHandle {
-    /// How many streams are currently active.
-    active_streams: Arc<AtomicUsize>,
+pub struct ConnectionHandle {
+    // How many streams are currently active.
+    // active_streams: Arc<AtomicUsize>,
 
-    /// Number of requests queued in the connection
-    ///
-    /// Should only be nonzero when active_streams matches max_concurrent_streams.
-    queued_requests: Arc<AtomicUsize>,
+    // Number of requests queued in the connection
+    //
+    // Should only be nonzero when active_streams matches max_concurrent_streams.
+    // queued_requests: Arc<AtomicUsize>,
 
-    /// How many active streams the connection may have
-    ///
-    /// This is determined when the initial SETTINGS frame is received.
-    max_concurrent_streams: u32,
+    // How many active streams the connection may have
+    //
+    // This is determined when the initial SETTINGS frame is received.
+    // max_concurrent_streams: u32,
 
     /// Sender to event loop where connection is running.
     tx: mio::Sender,
@@ -124,7 +130,10 @@ pub struct Worker {
     connect_timeout: u32,
 
     /// Connections
-    connections: Slab<Connection>
+    connections: Slab<Connection>,
+
+    /// True when the worker is cleaning up and shutting down
+    closing: bool,
 }
 
 /// Handle to a worker
@@ -221,6 +230,7 @@ impl Worker {
             info: info.clone(),
             rx: rx,
             connections: Slab::new(config.conns_per_thread),
+            closing: false,
         };
 
         let mut event_loop = EventLoop::new().expect("create event loop");
@@ -256,22 +266,35 @@ impl Worker {
             if let Ok(msg) = self.rx.try_recv() {
                 match msg {
                     Msg::CreatePlaintextConnection(stream, handler) => {
-                        self.add_connection(event_loop, stream, handler);
+                        if self.closing {
+                            handler.on_error(CreateConnectionError::WorkerClosing);
+                        } else {
+                            self.add_connection(event_loop, stream, handler);
+                        }
                     },
                     Msg::ConnectionMsg(ref connection_msg) => {
                         self.connections[token].notify(event_loop, connection_msg);
                     },
                     Msg::Terminate => {
-                        // this will terminate it...
-                        unimplemented!();
+                        if !self.closing {
+                            self.closing = true;
+                            event_loop.shutdown();
+                        }
                     }
                 }
             }
         }
     }
 
+    /// Main function for the worker thread
+    ///
+    /// Runs the event loop indefinitely until shutdown is called.
     pub fn run(&mut self, event_loop: &mut EventLoop<Worker>) {
         event_loop.run(&mut self);
+
+        // TODO remaining connections need to finish their work, close out streams, etc. Raise a
+        // flag on each of the connections that shutdown is happening so new requests are rejected.
+        self.closing = true;
     }
 }
 
@@ -351,6 +374,7 @@ impl Connection {
             },
             Message::Proto(msg) => {
                 let conn_ref = ConnectionRef {
+                    event_loop: event_loop,
                     backlog: &mut self.backlog,
                     handle: ConnectionHandle::new(
                         DispatcherHandle::new_for_loop(event_loop),
@@ -374,17 +398,16 @@ impl Connection {
             },
             Ok(Some(n)) => {
                 debug!("read {} bytes", n);
-                let drain = {
-                    let conn_ref = ConnectionRef {
-                        backlog: &mut self.backlog,
-                        handle: ConnectionHandle::new(
-                            DispatcherHandle::new_for_loop(event_loop),
-                            self.token),
-                        writable: self.is_writable,
-                    };
-                    let buf = &self.read_buf;
-                    self.protocol.on_data(buf, conn_ref).unwrap()
+                let conn_ref = ConnectionRef {
+                    event_loop: event_loop,
+                    token: self.token,
+                    backlog: &mut self.backlog,
+                    is_writable: self.is_writable,
+                    handler: &*self.handler,
                 };
+                let buf = &self.read_buf;
+                let consumed = self.protocol.on_data(buf, conn_ref).unwrap();
+                trace!("Draining... {}/{}", consumed, self.read_buf.len());
 
                 // TODO Would a circular buffer be better than draining here...?
                 // Though it might not be ... there shouldn't be that many elems
@@ -393,15 +416,15 @@ impl Connection {
                 // read needs to be done because we're about to wrap around in the
                 // buffer ... on the other hand, a mini read every-so-often might
                 // even be okay? If it eliminates copies...
-                trace!("Draining... {}/{}", drain, self.read_buf.len());
-                self.read_buf.drain(..drain);
+                self.read_buf.drain(..consumed);
 
                 trace!("Done.");
             },
             Ok(None) => {
-                debug!("read WOULDBLOCK");
+                trace!("read WOULDBLOCK");
             },
             Err(e) => {
+                // TODO FIXME
                 panic!("got an error trying to read; err={:?}", e);
             },
         };
@@ -422,11 +445,11 @@ impl Connection {
             // potentially provide more.
             {
                 let conn_ref = ConnectionRef {
+                    event_loop: event_loop,
+                    token: self.token,
                     backlog: &mut self.backlog,
-                    handle: ConnectionHandle::new(
-                        DispatcherHandle::new_for_loop(event_loop),
-                        self.token),
-                    writable: self.is_writable,
+                    is_writable: self.is_writable,
+                    handler: &*self.handler,
                 };
                 self.protocol.ready_write(conn_ref);
             }
@@ -489,5 +512,26 @@ impl Connection {
 
     pub fn queue_frame(&mut self, frame: Vec<u8>) {
         self.backlog.push(Cursor::new(frame));
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// ConnectionRef impls
+/// ------------------------------------------------------------------------------------------------
+
+impl DispatchConnectionEvent for ConnectionRef {
+    #[inline]
+    fn on_connection<S: Settings>(&self) {
+        let handle = ConnectionHandle {
+           tx: self.event_loop.channel(),
+           token: self.token,
+        };
+
+        self.handler.on_connection(handle);
+    }
+
+    #[inline]
+    fn on_pong(&self) {
+        self.handler.on_pong();
     }
 }

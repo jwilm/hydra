@@ -23,15 +23,15 @@ pub use hyper::header::{self, Headers};
 
 use solicit::http::session;
 
-mod worker;
-mod util;
-mod protocol;
+pub mod worker;
+pub mod util;
+pub mod protocol;
 
 use worker::Worker;
 
 pub trait ConnectionHandler: Send + 'static {
-    fn on_connection(&self);
-    fn on_error(&self, err: ConnectionError);
+    fn on_connection(&self, worker::ConnectionHandle);
+    fn on_error(&self, ConnectionError);
     fn on_pong(&self);
 }
 
