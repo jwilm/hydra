@@ -534,6 +534,7 @@ impl<'a, State, G, S> session::Session for ClientSession<'a, State, G, S>
     }
 
     fn on_pong(&mut self, _ping: &frame::PingFrame, _conn: &mut HttpConnection) -> HttpResult<()> {
+        // TODO need to call the connection handler on_pong function
         debug!("Received a PING ack");
         Ok(())
     }
