@@ -1,5 +1,7 @@
 use std::sync::mpsc;
+use std::fmt;
 use std::sync::Arc;
+use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{Cursor, Read};
 
@@ -8,12 +10,13 @@ use solicit::http::{HttpScheme, HttpResult, Header, StreamId};
 use solicit::http::connection::{HttpConnection, SendFrame, ReceiveFrame, HttpFrame};
 use solicit::http::client::{write_preface, ClientConnection, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
-use solicit::http::session::{self, StreamDataChunk, StreamDataError};
+use solicit::http::session::{self, StreamDataChunk, StreamDataError, Stream as SessionStream};
 
 use httparse;
+use connection::{self, DispatchConnectionEvent};
 
 /// Stream events and Request/Response bytes are delivered to/from the handler.
-pub trait StreamHandler: Send + 'static {
+pub trait StreamHandler: Send + fmt::Debug + 'static {
     /// Provide data from the request body
     fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
 
@@ -32,20 +35,24 @@ pub trait StreamHandler: Send + 'static {
 
 pub trait Protocol: Sized + 'static {
     fn new() -> Self;
-    fn on_data(&mut self, buf: &[u8], conn: ConnectionRef) -> Result<usize, ()>;
-    fn ready_write(&mut self, conn: ConnectionRef);
-    fn notify(&mut self, msg: Self::Message, conn: ConnectionRef);
+    fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> Result<usize, ()>;
+    fn ready_write(&mut self, conn: connection::Ref);
+    fn notify(&mut self, msg: Msg, conn: connection::Ref);
 }
 
 /// Messages for an HTTP/2 state machine
+#[derive(Debug)]
 pub enum Msg {
+    /// Create a new stream on the current connection
     CreateStream(::Request, Box<StreamHandler>),
+
+    /// Send a PING to the other end of connection
     Ping,
 }
 
 /// SendFrame implementor that pushes onto the connection outgoing frame list.
 struct SendDirect<'brw, 'conn> where 'conn: 'brw {
-    conn: &'brw mut ConnectionRef<'conn, Http2>,
+    conn: &'brw mut connection::Ref<'conn>,
 }
 
 impl<'a, 'b> SendFrame for SendDirect<'a, 'b> {
@@ -84,19 +91,8 @@ impl<'a> WrappedReceive<'a> {
 
 impl<'a> ReceiveFrame for WrappedReceive<'a> {
     /// Take the wrapped frame and parse it
-    ///
-    /// # Panics
-    ///
-    /// Panics if called more than once for a given WrappedReceive instance
-    ///
-    /// # TODO
-    ///
-    /// HttpFrame should also allow for borrowed frame buffers. As it stands, at this point we have
-    /// to make a copy!!! This is not the fault of the ReceiveFrame abstraction, though. The same
-    /// would happen if the HttpConn itself parsed a raw buffer into a frame, since it'd need to
-    /// create an HttpFrame at some point in order to correspondingly handle it...
     fn recv_frame(&mut self) -> HttpResult<HttpFrame> {
-        HttpFrame::from_raw(self.frame.take().unwrap())
+        HttpFrame::from_raw(self.frame.as_ref().unwrap())
     }
 }
 
@@ -121,10 +117,10 @@ impl session::Stream for Stream {
     }
 
     fn set_headers(&mut self, headers: Vec<Header>) {
-        let httparse_headers = headers.map(|header| {
+        let httparse_headers = headers.iter().map(|header| {
             httparse::Header {
-                name: str::from_utf8(&header.0[..]).unwrap(),
-                value: &header.1[..],
+                name: str::from_utf8(&header.name).unwrap(),
+                value: &header.value,
             }
         }).collect::<Vec<_>>();
 
@@ -153,10 +149,9 @@ impl session::Stream for Stream {
 }
 
 pub struct Http2 {
-    init: bool,
     got_settings: bool,
     conn: HttpConnection,
-    state: DefaultSessionState<BoxStream>,
+    state: DefaultSessionState<session::Client, BoxStream>,
 
     /// Dynamic protocol configuration
     settings: Http2Settings,
@@ -204,7 +199,7 @@ impl Http2 {
             Header::new(b":method", format!("{}", method).into_bytes()),
             Header::new(b":path", path.into_bytes()),
             Header::new(b":authority", &b"http2bin.org"[..]),
-            Header::new(b":scheme", self.conn.scheme().as_bytes().to_vec()),
+            Header::new(b":scheme", self.scheme().as_bytes().to_vec()),
         ];
 
         let stream = Stream::new(handler);
@@ -260,10 +255,8 @@ impl Http2 {
     }
 
     /// Send a PING
-    pub fn send_ping<S: SendFrame>(&mut self) -> HttpResult<()> {
-        let mut sender = SendDirect { conn: &mut self.conn };
-        try!(self.conn.sender(sender).send_ping(0));
-        Ok(())
+    pub fn send_ping<S: SendFrame>(&mut self, sender: &mut S) -> HttpResult<()> {
+        self.conn.sender(sender).send_ping(0)
     }
 
     /// Fully handles the next incoming frame provided by the given `ReceiveFrame` instance.
@@ -290,12 +283,11 @@ impl Http2 {
         self.conn.sender(sender).send_next_data(&mut prioritizer)
     }
 
-    fn initialize(&mut self) {
+    fn initialize(&mut self, mut conn: connection::Ref) {
         // Write preface
         let mut buf = Vec::new();
         write_preface(&mut buf).unwrap();
         conn.queue_frame(buf);
-        self.init = true;
     }
 }
 
@@ -303,15 +295,16 @@ impl Protocol for Http2 {
     fn new() -> Http2 {
         let raw_conn = HttpConnection::new(HttpScheme::Http);
         let state = session::default_client_state();
-        let settings = Http2Settings::new();
+
         Http2 {
-            init: false,
-            conn: ClientConnection::with_connection(raw_conn, state),
-            settings: settings,
+            conn: raw_conn,
+            settings: Default::default(),
+            got_settings: false,
+            state: state,
         }
     }
 
-    fn on_data<'a>(&mut self, buf: &[u8], mut conn: ConnectionRef) -> Result<usize, ()> {
+    fn on_data<'a>(&mut self, buf: &[u8], mut conn: connection::Ref) -> Result<usize, ()> {
         trace!("Http2: Received something back");
         let mut total_consumed = 0;
         loop {
@@ -319,7 +312,7 @@ impl Protocol for Http2 {
                 None => {
                     // No frame available yet. We consume nothing extra and wait for more data to
                     // become available to retry.
-                    let done = self.conn.state.get_closed();
+                    let done = self.state.get_closed();
                     for stream in done {
                         info!("Got response!");
                     }
@@ -327,7 +320,7 @@ impl Protocol for Http2 {
                     break;
                 },
                 Some(mut receiver) => {
-                    let len = receiver.frame().len();
+                    let len = receiver.frame().unwrap().len();
                     debug!("Handling an HTTP/2 frame of total size {}", len);
 
                     let mut sender = SendDirect { conn: &mut conn };
@@ -348,7 +341,7 @@ impl Protocol for Http2 {
         Ok(total_consumed)
     }
 
-    fn ready_write(&mut self, mut conn: ConnectionRef<Http2>) {
+    fn ready_write(&mut self, mut conn: connection::Ref) {
         // TODO See about giving it only a reference to some parts of the connection
         // (perhaps conveniently wrapped in some helper wrapper) instead of the
         // full Conn. In fact, that is probably a must, as the protocol would like
@@ -357,27 +350,23 @@ impl Protocol for Http2 {
         // could use the ref to the evtloop so that it can dispatch messages to it,
         // perhaps even asynchronously.
         trace!("Hello, from HTTP2");
-        if !self.init {
-            self.initialize();
-        } else {
-            let mut sender = SendDirect { conn: &mut conn };
-            self.send_next_data(&mut sender);
-        }
+
+        let mut sender = SendDirect { conn: &mut conn };
+        self.send_next_data(&mut sender);
     }
 
-    fn notify(&mut self, msg: Msg, mut conn: ConnectionRef) {
+    fn notify(&mut self, msg: Msg, mut conn: connection::Ref) {
         trace!("Http2 notified: msg={:?}", msg);
 
-        if !self.init {
-            self.initialize();
-        }
-
+        // A sender is needed for all message variants
+        let mut sender = SendDirect { conn: &mut conn };
         match msg {
             Msg::CreateStream(request, handler) => {
-                let stream = Http2::new_stream(request, handler);
-                let mut sender = SendDirect { conn: &mut conn };
-                self.start_request(stream, &mut sender);
+                self.start_request(Http2::new_stream(request, handler), &mut sender);
             },
+            Msg::Ping => {
+                self.send_ping(&mut sender);
+            }
         }
     }
 }
@@ -507,7 +496,7 @@ impl<'a, State, G, S> session::Session for ClientSession<'a, State, G, S>
     {
         debug!("Sending a SETTINGS ack");
 
-        for setting in &settings {
+        for setting in settings {
             if let HttpSetting::MaxConcurrentStreams(val) = setting {
                 self.settings.set_max_concurrent_streams(val);
             }

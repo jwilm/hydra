@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::Cell;
 use std::net::{self, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::io::Result;
+use std::io;
 
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
@@ -28,18 +28,16 @@ use solicit::http::session;
 pub mod worker;
 pub mod util;
 pub mod protocol;
+pub mod connection;
 
 use worker::Worker;
 
 pub use protocol::StreamHandler;
-
-pub trait ConnectionHandler: Send + 'static {
-    fn on_connection(&self, worker::ConnectionHandle);
-    fn on_error(&self, ConnectionError);
-    fn on_pong(&self);
-}
+pub use connection::Handler as ConnectionHandler;
 
 pub trait Connector: Send + 'static {}
+
+use util::each_addr;
 
 // pub struct TlsConnector;
 // impl Connector for TlsConnector {}
@@ -49,7 +47,7 @@ impl Connector for PlaintextConnector {}
 
 pub struct Config {
     pub threads: u8,
-    pub connect_timeout: u32,
+    pub connect_timeout_ms: u32,
     pub conns_per_thread: usize,
 }
 
@@ -61,26 +59,6 @@ impl Default for Config {
             conns_per_thread: 1024,
         }
     }
-}
-
-/// Run F for each addr
-///
-/// Does synchronous DNS lookup with getaddrinfo. This function was ripped from the stb library
-/// (it's private).
-fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
-    where F: FnMut(&SocketAddr) -> io::Result<T>
-{
-    let mut last_err = None;
-    for addr in try!(addr.to_socket_addrs()) {
-        match f(&addr) {
-            Ok(l) => return Ok(l),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        Error::new(ErrorKind::InvalidInput,
-                   "could not resolve to any addresses")
-    }))
 }
 
 /// Interface to evented HTTP/2 client worker pool
@@ -105,7 +83,7 @@ impl Hydra {
     /// Connect to a host on plaintext transport
     ///
     /// FIXME U should be ToSocketAddrs
-    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<Client<'a>, Error>
+    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<Client<'a>>
         where U: ToSocketAddrs,
               H: ConnectionHandler,
     {
@@ -148,6 +126,7 @@ impl<'a> Client<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Request {
     method: Method,
     path: String,
@@ -166,10 +145,10 @@ impl Request {
         }
     }
 
-    pub fn new<P, B>(method: Method, path: P) -> Request
+    pub fn request<P, B>(method: Method, path: P) -> Request
         where P: Into<String>,
     {
-        // TODO headers
+        // TODO headers - either here or via the handler. I'm inclined to say the handler.
         Request {
             method: method,
             path: path.into(),
@@ -182,8 +161,20 @@ impl Request {
 pub struct Response;
 
 pub enum ConnectionError {
-    /// Error parsing a str as socket address
-    ParseSocketAddr(net::AddrParseError),
+    /// IO layer encountered an error.
+    Io(io::Error),
+
+    /// Timeout while connecting
+    Timeout,
+
+    /// The worker is closing and a connection can not be created.
+    WorkerClosing,
+}
+
+impl From<io::Error> for ConnectionError {
+    fn from(err: io::Error) -> ConnectionError {
+        ConnectionError::Io(err)
+    }
 }
 
 type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;

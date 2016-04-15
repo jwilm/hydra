@@ -36,25 +36,29 @@ impl hydra::ConnectionHandler for ConnectHandler {
     }
 }
 
-fn response_collector() -> (StreamHandler, ResponseCollector) {
-    let (tx, rx) = mpsc::channel();
-    let counter = Arc::new(AtomicUsize::new(1));
-    let handler = StreamHandler::new(tx, counter.clone());
-    let collector = ResponseCollector::new(rx, counter);
-
-    (handler, collector)
-}
-
 struct ResponseCollector {
     rx: mpsc::Receiver<Option<hydra::Response>>,
+    tx: mpsc::Receiver<Option<hydra::Response>>,
     counter: Arc<AtomicUsize>,
 }
 
 impl ResponseCollector {
-    pub fn new(rx: mpsc::Receiver<Option<hydra::Response>>, counter: Arc<AtomicUsize>)
-        -> ResponseCollector
-    {
-        ResponseCollector { rx: rx, counter: counter}
+    pub fn new() -> ResponseCollector {
+        let (tx, rx) = mpsc::channel();
+        ResponseCollector {
+            rx: rx,
+            tx: tx,
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn new_stream_handler(&self) -> StreamHandler {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+
+        StreamHandler {
+            tx: self.tx.clone(),
+            counter: self.counter.clone(),
+        }
     }
 
     pub fn wait_all(&self) {
@@ -117,16 +121,12 @@ fn send_request() {
         _ => panic!("Didn't recv Connected"),
     };
 
-    let (req_handler, collector) = response_collector();
+    let collector = ResponseCollector::new();
 
-    let req = Request::new(Method::Get, "/get", "");
-    client.request(req, req_handler.clone());
-
-    let req = Request::new(Method::Get, "/get", "");
-    client.request(req, req_handler.clone());
-
-    let req = Request::new(Method::Get, "/get", "");
-    client.request(req, req_handler);
+    for _ in 0..3 {
+        let req = Request::new(Method::Get, "/get", "");
+        client.request(req, collector.new_stream_handler());
+    }
 
     collector.wait_all();
 }

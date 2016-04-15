@@ -14,7 +14,7 @@ httparse = "*"
 
 [dependencies.solicit]
 version = "0.4"
-path = "/home/jwilm/code/solicit"
+path = "../solicit"
 
 [features]
 tls = ["openssl"]
