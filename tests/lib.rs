@@ -1,7 +1,6 @@
 extern crate hydra;
 extern crate env_logger;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -9,12 +8,16 @@ use hydra::{Method, Request, Hydra};
 use hydra::{connection, protocol};
 use hydra::Headers;
 
+/// Messages sent by ConnectHandler
 enum ConnectionMsg {
     Error(hydra::ConnectionError),
     Connected(connection::Handle),
     Pong
 }
 
+/// Handles connection related events by implementing connection::Handler
+///
+/// All events are sent on a channel.
 #[derive(Debug)]
 struct ConnectHandler {
     tx: mpsc::Sender<ConnectionMsg>,
@@ -40,50 +43,70 @@ impl connection::Handler for ConnectHandler {
     }
 }
 
+/// Helper for receiving multiple responses
+///
+/// To use the collector, first create one with `new`, and call `new_stream_handler` for every
+/// StreamHandler that is needed (one per request). The `wait_all` function is used to block until
+/// all of the streams have been resolved through any means (nominally, error, etc).
 struct ResponseCollector {
     rx: mpsc::Receiver<Option<Vec<u8>>>,
     tx: mpsc::Sender<Option<Vec<u8>>>,
-    counter: Arc<AtomicUsize>,
+    counter: AtomicUsize,
 }
 
-impl ResponseCollector {
-    pub fn new() -> ResponseCollector {
+impl Default for ResponseCollector {
+    fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         ResponseCollector {
             rx: rx,
             tx: tx,
-            counter: Arc::new(AtomicUsize::new(0)),
+            counter: AtomicUsize::new(0),
         }
     }
+}
 
+impl ResponseCollector {
+    /// Builds a ResponseCollector
+    pub fn new() -> ResponseCollector {
+        Default::default()
+    }
+
+    /// Get a stream handler
+    ///
+    /// Returns a StreamHandler and increments the number of responses `wait_all` expects
     pub fn new_stream_handler(&self) -> StreamHandler {
         self.counter.fetch_add(1, Ordering::Relaxed);
 
-        StreamHandler::new(self.tx.clone(), self.counter.clone())
+        StreamHandler::new(self.tx.clone())
     }
 
+    /// Block until a response is received for every stream handler.
+    ///
+    /// TODO would be nice if this could time out; it currently blocks indefinitely.
     pub fn wait_all(&self) {
         while self.counter.load(Ordering::SeqCst) != 0 {
             let msg = self.rx.recv().unwrap();
+            self.counter.fetch_sub(1, Ordering::SeqCst);
             println!("resp: {:?}", msg);
         }
     }
 }
 
+/// Implementor of hydra::StreamHandler; receives stream events
+///
+/// When an error occurs or the stream terminates normally, an event is sent on the channel passed
+/// to `new`.
 #[derive(Debug)]
 struct StreamHandler {
     tx: mpsc::Sender<Option<Vec<u8>>>,
     res: Vec<u8>,
-    counter: Arc<AtomicUsize>,
 }
 
 impl StreamHandler {
-    pub fn new(tx: mpsc::Sender<Option<Vec<u8>>>,
-               counter: Arc<AtomicUsize>) -> StreamHandler
+    pub fn new(tx: mpsc::Sender<Option<Vec<u8>>>) -> StreamHandler
     {
         StreamHandler {
             tx: tx,
-            counter: counter,
             res: Vec::new()
         }
     }
@@ -91,7 +114,6 @@ impl StreamHandler {
 
 impl hydra::StreamHandler for StreamHandler {
     fn on_error(&mut self, _err: hydra::RequestError) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
         self.tx.send(None).unwrap();
     }
 
@@ -112,8 +134,6 @@ impl hydra::StreamHandler for StreamHandler {
 
     /// Called when the stream is closed (complete)
     fn on_close(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
-
         let mut res = Vec::new();
         ::std::mem::swap(&mut self.res, &mut res);
 
