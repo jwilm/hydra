@@ -94,7 +94,7 @@ impl Hydra {
         let stream = try!(each_addr(addr, mio::tcp::TcpStream::connect));
 
         let next = self.next.fetch_add(1, Ordering::SeqCst);
-        let ref worker = self.workers[next * self.workers.len()];
+        let ref worker = self.workers[next % self.workers.len()];
 
         worker.connect(stream, Box::new(handler));
 
