@@ -15,8 +15,11 @@ use protocol::{self, Protocol, Http2};
 use connection::{self, Connection};
 use util::thread;
 
+use super::ConnectionError;
+
 /// Messages sent to the worker
-enum Msg {
+#[derive(Debug)]
+pub enum Msg {
     /// Request to establish a new connection.
     CreatePlaintextConnection(TcpStream, Box<connection::Handler>),
 
@@ -27,7 +30,7 @@ enum Msg {
     Terminate,
 }
 
-enum Timeout {
+pub enum Timer {
     /// Connect timed out
     Connect(Token),
 }
@@ -52,7 +55,7 @@ pub struct Worker {
     info: Arc<Info>,
 
     /// Connect timeout
-    connect_timeout: u32,
+    connect_timeout_ms: u32,
 
     /// Connections
     connections: Slab<Connection>,
@@ -103,11 +106,8 @@ impl Handle {
     }
 
     /// Worker should create a new connection with the given TcpStream
-    pub fn connect(&self,
-                   stream: TcpStream,
-                   handler: Box<connection::Handler>) -> Result<(), SendError<Msg>>
-    {
-        self.tx.send(Msg::CreatePlaintextConnection(stream, handler))
+    pub fn connect(&self, stream: TcpStream, handler: Box<connection::Handler>) {
+        self.tx.send(Msg::CreatePlaintextConnection(stream, handler));
     }
 }
 
@@ -144,10 +144,11 @@ impl Worker {
     ///
     /// Spawns a new thread with a worker using config. A `Handle` for the Worker thread is retured.
     pub fn spawn(config: &::Config) -> Handle {
+        trace!("spawning a hydra worker");
         let info = Arc::new(Info::new());
 
         let mut worker = Worker {
-            connect_timeout: config.connect_timeout,
+            connect_timeout_ms: config.connect_timeout_ms,
             info: info.clone(),
             connections: Slab::new(config.conns_per_thread),
             closing: false,
@@ -178,10 +179,12 @@ impl Worker {
     {
         self.connections.insert_with(|token| {
             let events = EventSet::readable() | EventSet::writable();
-            let pollopt = mio::PollOpt::edge();
+            let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
             event_loop.register(&stream, token, events, pollopt);
 
-            let conn = Connection::new(token, stream, handler);
+            let mut conn = Connection::new(token, stream, handler);
+            conn.initialize(event_loop);
+            conn
         });
     }
 
@@ -189,16 +192,18 @@ impl Worker {
     ///
     /// Runs the event loop indefinitely until shutdown is called.
     pub fn run(&mut self, event_loop: &mut EventLoop<Worker>) {
-        event_loop.run(&mut self);
+        info!("worker running");
+        event_loop.run(self);
 
         // TODO remaining connections need to finish their work, close out streams, etc. Raise a
         // flag on each of the connections that shutdown is happening so new requests are rejected.
         self.closing = true;
+        info!("worker terminated");
     }
 }
 
 impl mio::Handler for Worker {
-    type Timeout = Timeout;
+    type Timeout = Timer;
     type Message = Msg;
 
     fn ready(&mut self,
@@ -209,7 +214,8 @@ impl mio::Handler for Worker {
         self.connections[token].ready(event_loop, events);
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<Worker>, _msg: Msg) {
+    fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: Msg) {
+        debug!("worker got msg: {:?}", msg);
         match msg {
             Msg::CreatePlaintextConnection(stream, handler) => {
                 if self.closing {
@@ -218,7 +224,7 @@ impl mio::Handler for Worker {
                     self.add_connection(event_loop, stream, handler);
                 }
             },
-            Msg::Protocol(ref protocol_msg) => {
+            Msg::Protocol(token, protocol_msg) => {
                 self.connections[token].notify(event_loop, protocol_msg);
             },
             Msg::Terminate => {
@@ -230,13 +236,13 @@ impl mio::Handler for Worker {
         }
     }
 
-    fn timeout(&mut self, event_loop: &mut EventLoop<Worker>, timeout: Timeout) {
+    fn timeout(&mut self, event_loop: &mut EventLoop<Worker>, timeout: Timer) {
         match timeout {
-            Timeout::ConnectTimeout(token) => {
+            Timer::Connect(token) => {
                 // If a ConnectTimeout arrives, that means the connection has not been established.
                 // Remove the connection and run the timeout handler.
                 if let Some(conn) = self.connections.remove(token) {
-                    event_loop.deregister(conn.stream);
+                    event_loop.deregister(conn.stream());
                     conn.on_connect_timeout();
                 }
             }

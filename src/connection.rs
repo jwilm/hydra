@@ -1,14 +1,16 @@
 //! Interactions with the I/O layer and the HTTP/2 state machine
 use std::io::Cursor;
+use std::fmt;
 
-use mio::{self, EventSet, EventLoop};
+use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 
 use worker::{self, Worker};
-use protocol::{self, Settings};
+use protocol::{self, Settings, Protocol, Http2};
 use super::ConnectionError;
 
+
 /// Type that receives events for a connection
-pub trait Handler: Send + 'static {
+pub trait Handler: Send + fmt::Debug + 'static {
     fn on_connection(&self, Handle);
     fn on_error(&self, ConnectionError);
     fn on_pong(&self);
@@ -22,9 +24,9 @@ pub trait Handler: Send + 'static {
 /// frames.
 ///
 /// The worker manages a set of connections using an event loop.
-struct Connection {
+pub struct Connection {
     token: mio::Token,
-    stream: mio::TcpStream,
+    stream: mio::tcp::TcpStream,
     backlog: Vec<Cursor<Vec<u8>>>,
     is_writable: bool,
     protocol: Http2,
@@ -45,11 +47,11 @@ enum WriteStatus {
 }
 
 /// A projection of the Connection type for use within the worker thread.
-struct Ref<'a> {
+pub struct Ref<'a> {
     backlog: &'a mut Vec<Cursor<Vec<u8>>>,
-    handler: &'a ConnectionHandler,
+    handler: &'a Handler,
     event_loop: &'a mut EventLoop<Worker>,
-    token: Token,
+    token: mio::Token,
     is_writable: bool,
 }
 
@@ -83,7 +85,7 @@ impl Handle {
         self.tx.send(worker::Msg::Protocol(self.token, msg));
     }
 
-    fn request<H>(&self, req: ::Request, handler: H)
+    pub fn request<H>(&self, req: ::Request, handler: H)
         where H: protocol::StreamHandler
     {
         self.send(protocol::Msg::CreateStream(req, Box::new(handler)));
@@ -101,6 +103,7 @@ pub trait DispatchConnectionEvent {
 
 impl<'a> Ref<'a> {
     pub fn queue_frame(&mut self, frame: Vec<u8>) {
+        trace!("Ref::queue_frame");
         self.backlog.push(Cursor::new(frame));
     }
 
@@ -135,12 +138,13 @@ impl<'a> DispatchConnectionEvent for Ref<'a> {
 /// ------------------------------------------------------------------------------------------------
 
 impl Connection {
-    fn on_connect_timeout(&self) {
-        self.handler.
+    pub fn on_connect_timeout(&self) {
+        self.handler.on_error(ConnectionError::Timeout);
     }
 
-    fn new(token: Token, stream: mio::TcpStream, handler: Box<Handler>) -> Connection {
-        let conn = Connection {
+    pub fn new(token: mio::Token, stream: mio::tcp::TcpStream, handler: Box<Handler>) -> Connection {
+        trace!("Connection::new");
+        Connection {
             token: token,
             stream: stream,
             backlog: Vec::new(),
@@ -148,21 +152,28 @@ impl Connection {
             protocol: Http2::new(),
             read_buf: Vec::with_capacity(4096),
             handler: handler,
-        };
-
-        let conn_ref = Ref {
-            event_loop: event_loop,
-            backlog: &mut conn.backlog,
-            token: conn.token,
-            handler: conn.handler,
-            is_writable: conn.is_writable,
-        };
-
-        conn.protocol.initialize();
-        conn
+        }
     }
 
-    fn ready(&mut self, event_loop: &mut EventLoop<Worker>, events: EventSet) {
+    #[inline]
+    pub fn stream(&self) -> &mio::tcp::TcpStream {
+        &self.stream
+    }
+
+    pub fn initialize(&mut self, event_loop: &mut EventLoop<Worker>) {
+        trace!("Connection::initialize");
+        let conn_ref = Ref {
+            event_loop: event_loop,
+            backlog: &mut self.backlog,
+            token: self.token,
+            handler: &*self.handler,
+            is_writable: self.is_writable,
+        };
+
+        self.protocol.initialize(conn_ref);
+    }
+
+    pub fn ready(&mut self, event_loop: &mut EventLoop<Worker>, events: EventSet) {
         trace!("Connection ready: token={:?}; events={:?}", self.token, events);
         if events.is_readable() {
             self.read(event_loop);
@@ -172,20 +183,35 @@ impl Connection {
             // Whenever the connection becomes writable, we try a write.
             self.try_write(event_loop).unwrap();
         }
+
+        self.reregister(event_loop);
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
+    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) {
+        let mut flags = mio::EventSet::readable();
+        if !self.backlog.is_empty() {
+            flags = flags | mio::EventSet::writable();
+        }
+
+        let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
+        event_loop.reregister(self.stream(), self.token, flags, pollopt);
+    }
+
+    pub fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
         trace!("Connection notified: token={:?}; msg={:?}", self.token, msg);
 
-        let conn_ref = Ref {
-            event_loop: event_loop,
-            backlog: &mut self.backlog,
-            token: self.token,
-            handler: self.handler,
-            is_writable: self.is_writable,
-        };
+        {
+            let conn_ref = Ref {
+                event_loop: event_loop,
+                backlog: &mut self.backlog,
+                token: self.token,
+                handler: &*self.handler,
+                is_writable: self.is_writable,
+            };
 
-        self.protocol.notify(msg, conn);
+            self.protocol.notify(msg, conn_ref);
+        }
+        self.reregister(event_loop);
     }
 
     fn read(&mut self, event_loop: &mut EventLoop<Worker>) {
@@ -200,16 +226,17 @@ impl Connection {
             },
             Ok(Some(n)) => {
                 debug!("read {} bytes", n);
-                let conn_ref = Ref {
-                    event_loop: event_loop,
-                    token: self.token,
-                    backlog: &mut self.backlog,
-                    is_writable: self.is_writable,
-                    handler: &*self.handler,
+                let consumed = {
+                    let conn_ref = Ref {
+                        event_loop: event_loop,
+                        token: self.token,
+                        backlog: &mut self.backlog,
+                        is_writable: self.is_writable,
+                        handler: &*self.handler,
+                    };
+                    let buf = &self.read_buf;
+                    self.protocol.on_data(buf, conn_ref).unwrap()
                 };
-                let buf = &self.read_buf;
-                let consumed = self.protocol.on_data(buf, conn_ref).unwrap();
-                trace!("Draining... {}/{}", consumed, self.read_buf.len());
 
                 // TODO Would a circular buffer be better than draining here...?
                 // Though it might not be ... there shouldn't be that many elems
@@ -218,6 +245,7 @@ impl Connection {
                 // read needs to be done because we're about to wrap around in the
                 // buffer ... on the other hand, a mini read every-so-often might
                 // even be okay? If it eliminates copies...
+                trace!("Draining... {}/{}", consumed, self.read_buf.len());
                 self.read_buf.drain(..consumed);
 
                 trace!("Done.");
@@ -314,6 +342,7 @@ impl Connection {
     }
 
     pub fn queue_frame(&mut self, frame: Vec<u8>) {
+        trace!("Connection::queue_frame");
         self.backlog.push(Cursor::new(frame));
     }
 }

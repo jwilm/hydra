@@ -3,7 +3,8 @@ TODO
 
 # What I was doing when I stepped away
 
-Adding on_connection_timeout to Connection
+Just made HTTP requests successfully! Added a reregister function that may be
+super suboptimal when handling many notifications.
 
 # MVP TODOs
 

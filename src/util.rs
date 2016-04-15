@@ -19,7 +19,7 @@ pub mod thread {
 ///
 /// Does synchronous DNS lookup with getaddrinfo. This function was ripped from the std library
 /// (it's private).
-fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
+pub fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
     where F: FnMut(&SocketAddr) -> io::Result<T>
 {
     let mut last_err = None;

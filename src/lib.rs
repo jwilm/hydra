@@ -55,8 +55,8 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             threads: 8,
-            connect_timeout_ms: u32,
-            conns_per_thread: 1024,
+            connect_timeout_ms: 60_000,
+            conns_per_thread: 1_024,
         }
     }
 }
@@ -69,6 +69,8 @@ pub struct Hydra {
 
 impl Hydra {
     pub fn new(config: &Config) -> Hydra {
+        info!("spawning a hydra");
+
         let mut workers = Vec::new();
         for _ in 0..config.threads {
             workers.push(Worker::spawn(config));
@@ -83,18 +85,20 @@ impl Hydra {
     /// Connect to a host on plaintext transport
     ///
     /// FIXME U should be ToSocketAddrs
-    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<Client<'a>>
+    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<()>
         where U: ToSocketAddrs,
               H: ConnectionHandler,
     {
+        debug!("connect");
         // Parse the host param as a socket address
         let stream = try!(each_addr(addr, mio::tcp::TcpStream::connect));
 
         let next = self.next.fetch_add(1, Ordering::SeqCst);
-        let worker = self.workers[next * self.workers.len()];
-        let pending_connection = worker.connect(stream, Box::new(handler));
+        let ref worker = self.workers[next * self.workers.len()];
 
         worker.connect(stream, Box::new(handler));
+
+        Ok(())
     }
 
     #[cfg(feature = "tls")]
@@ -134,7 +138,7 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn new<P, B>(method: Method, path: P) -> Request
+    pub fn new<P>(method: Method, path: P) -> Request
         where P: Into<String>,
     {
         // TODO headers
@@ -144,8 +148,7 @@ impl Request {
             headers_only: false,
         }
     }
-
-    pub fn request<P, B>(method: Method, path: P) -> Request
+pub fn new_headers_only<P>(method: Method, path: P) -> Request
         where P: Into<String>,
     {
         // TODO headers - either here or via the handler. I'm inclined to say the handler.
@@ -160,6 +163,7 @@ impl Request {
 #[derive(Debug)]
 pub struct Response;
 
+#[derive(Debug)]
 pub enum ConnectionError {
     /// IO layer encountered an error.
     Io(io::Error),
@@ -177,7 +181,7 @@ impl From<io::Error> for ConnectionError {
     }
 }
 
-type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;
+pub type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;
 
 pub enum RequestError {
     Variant
