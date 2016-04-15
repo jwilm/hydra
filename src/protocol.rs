@@ -22,11 +22,15 @@ use connection::{self, DispatchConnectionEvent};
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
 /// Stream events and Request/Response bytes are delivered to/from the handler.
+///
+/// Functions of the StreamHandler are called on the event loop's thread. Any work done here should
+/// be as short as possible to not delay network I/O and processing of other streams.
 pub trait StreamHandler: Send + fmt::Debug + 'static {
     /// Provide data from the request body
     ///
     /// TODO maybe just reexport StreamDataChunk and StreamDataError?
     /// TODO use this method
+    /// Errors returned from get_data_chunk will result in a stream reset being sent to the server.
     fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
 
     /// Response headers are available
