@@ -1,11 +1,13 @@
 //! Helpers for writing Hydra tests
 use std::fmt;
+use std::io::Cursor;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::io::Cursor;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
 use hydra::StatusCode;
+
 
 /// Messages sent by ConnectHandler
 pub enum ConnectionMsg {
@@ -47,11 +49,12 @@ impl connection::Handler for ConnectHandler {
 /// To use the collector, first create one with `new`, and call `new_stream_handler` for every
 /// StreamHandler that is needed (one per request). The `wait_all` function is used to block until
 /// all of the streams have been resolved through any means (nominally, error, etc).
-pub struct ResponseCollector {
+pub struct ResponseCollector<S> {
     rx: mpsc::Receiver<Option<BufferedResponse>>,
     tx: mpsc::Sender<Option<BufferedResponse>>,
     counter: AtomicUsize,
     responses: Vec<BufferedResponse>,
+    _marker: PhantomData<S>
 }
 
 pub struct BufferedResponse {
@@ -59,7 +62,7 @@ pub struct BufferedResponse {
     pub body: Vec<u8>,
 }
 
-impl Default for ResponseCollector {
+impl<S> Default for ResponseCollector<S> {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         ResponseCollector {
@@ -67,23 +70,24 @@ impl Default for ResponseCollector {
             tx: tx,
             counter: AtomicUsize::new(0),
             responses: Vec::new(),
+            _marker: PhantomData
         }
     }
 }
 
-impl ResponseCollector {
+impl<S: Collectable> ResponseCollector<S> {
     /// Builds a ResponseCollector
-    pub fn new() -> ResponseCollector {
+    pub fn new() -> ResponseCollector<S> {
         Default::default()
     }
 
     /// Get a stream handler
     ///
     /// Returns a StreamHandler and increments the number of responses `wait_all` expects
-    pub fn new_stream_handler(&self) -> StreamHandler {
+    pub fn new_stream_handler(&self) -> S {
         self.counter.fetch_add(1, Ordering::Relaxed);
 
-        StreamHandler::new(self.tx.clone())
+        S::new(self.tx.clone())
     }
 
     /// Block until a response is received for every stream handler.
@@ -111,12 +115,16 @@ impl ResponseCollector {
     }
 }
 
+pub trait Collectable: hydra::StreamHandler {
+    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> Self;
+}
+
 /// Implementor of hydra::StreamHandler; receives stream events
 ///
 /// When an error occurs or the stream terminates normally, an event is sent on the channel passed
 /// to `new`.
 #[derive(Debug)]
-pub struct StreamHandler {
+pub struct HeadersOnlyHandler {
     tx: mpsc::Sender<Option<BufferedResponse>>,
     // outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
@@ -132,10 +140,9 @@ impl fmt::Display for BufferedResponse {
     }
 }
 
-impl StreamHandler {
-    pub fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> StreamHandler
-    {
-        StreamHandler {
+impl Collectable for HeadersOnlyHandler {
+    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> HeadersOnlyHandler {
+        HeadersOnlyHandler {
             tx: tx,
             body: Vec::new(),
             response: None,
@@ -143,7 +150,7 @@ impl StreamHandler {
     }
 }
 
-impl hydra::StreamHandler for StreamHandler {
+impl hydra::StreamHandler for HeadersOnlyHandler {
     fn on_error(&mut self, _err: hydra::RequestError) {
         self.tx.send(None).unwrap();
     }
@@ -177,6 +184,10 @@ impl hydra::StreamHandler for StreamHandler {
     }
 }
 
+/// Trait for checking responses; consumed by Collector.check_responses
+///
+/// The easiest way to get a type that implements CheckResponse is to use the `response_spec!`
+/// macro.
 pub trait CheckResponse {
     fn check(&BufferedResponse);
 }

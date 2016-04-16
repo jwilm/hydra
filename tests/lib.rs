@@ -36,7 +36,7 @@ fn three_get_streams_one_worker() {
     let handler = ConnectHandler::new(tx);
 
     let cluster = Hydra::new(&config);
-    let mut collector = ResponseCollector::new();
+    let mut collector = ResponseCollector::<HeadersOnlyHandler>::new();
 
     cluster.connect("http2bin.org:80", handler).unwrap();
 
@@ -69,7 +69,7 @@ fn three_workers_three_get_each() {
     let handler3 = ConnectHandler::new(tx.clone());
 
     let cluster = Hydra::new(&config);
-    let mut collector = ResponseCollector::new();
+    let mut collector = ResponseCollector::<HeadersOnlyHandler>::new();
 
     cluster.connect("http2bin.org:80", handler1).unwrap();
     cluster.connect("http2bin.org:80", handler2).unwrap();
