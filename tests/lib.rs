@@ -8,10 +8,21 @@ use std::sync::mpsc;
 use hydra::{Method, Request, Hydra};
 use hydra::{connection, protocol};
 use hydra::Headers;
+use hydra::StatusCode;
 
+#[macro_use]
 mod util;
 
 use util::*;
+
+response_spec! {
+    type_name => SimpleGetChecker,
+    status => StatusCode::Ok,
+    body_contains => [],
+    headers => {
+        "Server" => "h2o"
+    }
+}
 
 /// Test that several GET requests can run in parallel on a single thread.
 #[test]
@@ -25,7 +36,7 @@ fn three_get_streams_one_worker() {
     let handler = ConnectHandler::new(tx);
 
     let cluster = Hydra::new(&config);
-    let collector = ResponseCollector::new();
+    let mut collector = ResponseCollector::new();
 
     cluster.connect("http2bin.org:80", handler).unwrap();
 
@@ -41,6 +52,7 @@ fn three_get_streams_one_worker() {
     }
 
     collector.wait_all();
+    collector.check_responses(SimpleGetChecker);
 }
 
 /// Test that several GET request can run in parallel on separate threads
@@ -57,7 +69,7 @@ fn three_workers_three_get_each() {
     let handler3 = ConnectHandler::new(tx.clone());
 
     let cluster = Hydra::new(&config);
-    let collector = ResponseCollector::new();
+    let mut collector = ResponseCollector::new();
 
     cluster.connect("http2bin.org:80", handler1).unwrap();
     cluster.connect("http2bin.org:80", handler2).unwrap();
@@ -75,4 +87,5 @@ fn three_workers_three_get_each() {
     };
 
     collector.wait_all();
+    collector.check_responses(SimpleGetChecker);
 }

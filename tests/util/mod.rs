@@ -2,6 +2,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::io::Cursor;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
 use hydra::StatusCode;
@@ -50,11 +51,12 @@ pub struct ResponseCollector {
     rx: mpsc::Receiver<Option<BufferedResponse>>,
     tx: mpsc::Sender<Option<BufferedResponse>>,
     counter: AtomicUsize,
+    responses: Vec<BufferedResponse>,
 }
 
 pub struct BufferedResponse {
-    response: hydra::Response,
-    body: Vec<u8>,
+    pub response: hydra::Response,
+    pub body: Vec<u8>,
 }
 
 impl Default for ResponseCollector {
@@ -64,6 +66,7 @@ impl Default for ResponseCollector {
             rx: rx,
             tx: tx,
             counter: AtomicUsize::new(0),
+            responses: Vec::new(),
         }
     }
 }
@@ -86,20 +89,24 @@ impl ResponseCollector {
     /// Block until a response is received for every stream handler.
     ///
     /// TODO would be nice if this could time out; it currently blocks indefinitely.
-    pub fn wait_all(&self) {
+    pub fn wait_all(&mut self) {
         while self.counter.load(Ordering::SeqCst) != 0 {
             let msg = self.rx.recv().unwrap();
             self.counter.fetch_sub(1, Ordering::SeqCst);
             if let Some(buffered) = msg {
-                println!("{}", buffered);
-
-                let headers = &buffered.response.headers;
-                let server = headers.get::<::hyper::header::Server>().unwrap();
-                assert!(server.contains("h2o"));
-
-                let status = buffered.response.status;
-                assert_eq!(status, StatusCode::Ok);
+                self.responses.push(buffered);
+            } else {
+                panic!("unexpected msg");
             }
+        }
+    }
+
+    /// Run a checker against the buffered responses.
+    pub fn check_responses<C>(&self, _: C)
+        where C: CheckResponse,
+    {
+        for response in &self.responses {
+            C::check(response);
         }
     }
 }
@@ -111,6 +118,7 @@ impl ResponseCollector {
 #[derive(Debug)]
 pub struct StreamHandler {
     tx: mpsc::Sender<Option<BufferedResponse>>,
+    // outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
     response: Option<hydra::Response>
 }
@@ -167,4 +175,138 @@ impl hydra::StreamHandler for StreamHandler {
             body: res,
         })).unwrap();
     }
+}
+
+pub trait CheckResponse {
+    fn check(&BufferedResponse);
+}
+
+#[macro_export]
+macro_rules! response_spec {
+    {
+        type_name => $type_name:ident,
+        status => $status:expr,
+        body_contains => [$( $contains_str:expr ),*],
+        headers => {
+            $($header_name:expr => $header_value:expr),*
+        }
+    } => {
+        struct $type_name;
+
+        impl $crate::util::CheckResponse for $type_name {
+            fn check(res: &$crate::util::BufferedResponse) {
+                // Compare the status.
+                assert_eq!(res.response.status, $status);
+
+                // Get a utf8 body
+                let body = ::std::str::from_utf8(&res.body[..]).expect("utf8 body");
+
+                // Print it for debugging purposes. Will show up in case of panic or --nocapture.
+                println!("body: {}", body);
+
+                // Check each body_contains
+                $(
+                    assert!(body.contains($contains_str));
+                )*
+
+                // Check for header equivalence
+                let headers = &res.response.headers;
+
+                $(
+                    {
+                        // Types aren't used directly here since headers aren't required to impl Eq
+                        // or PartialEq. If that ever changes, accept a $ty param instead of $expr.
+                        let raw = headers.get_raw($header_name).unwrap();
+                        let utf8 = ::std::str::from_utf8(&raw[0][..]).unwrap();
+                        assert!(utf8.contains($header_value));
+                    }
+                )*
+            }
+        }
+    }
+}
+
+fn response_spec_test_response() -> BufferedResponse {
+    let mut headers = ::hyper::header::Headers::new();
+    headers.set(::hyper::header::Server("h2o/1.7.0".into()));
+
+    BufferedResponse {
+        body: "Hello, world!".as_bytes().to_vec(),
+        response: hydra::Response {
+            status: StatusCode::Ok,
+            headers: headers,
+        },
+    }
+}
+
+#[test]
+fn test_response_spec_macro() {
+    response_spec! {
+        type_name => SimpleGet,
+        status => StatusCode::Ok,
+        body_contains => ["Hello", "world"],
+        headers => {
+            "Server" => "h2o/1.7.0"
+        }
+    }
+
+    SimpleGet::check(&response_spec_test_response());
+}
+
+#[test]
+#[should_panic]
+fn test_response_spec_macro_body_doesnt_contain() {
+    response_spec! {
+        type_name => SimpleGet,
+        status => StatusCode::Ok,
+        body_contains => ["Goodbye", "cruel", "world"],
+        headers => {
+            "Server" => "h2o/1.7.0"
+        }
+    }
+
+    SimpleGet::check(&response_spec_test_response());
+}
+
+#[test]
+#[should_panic]
+fn test_response_spec_macro_different_status() {
+    response_spec! {
+        type_name => SimpleGet,
+        status => StatusCode::NotFound,
+        body_contains => [],
+        headers => { }
+    }
+
+    SimpleGet::check(&response_spec_test_response());
+}
+
+#[test]
+#[should_panic]
+fn test_response_spec_macro_missing_header() {
+    response_spec! {
+        type_name => SimpleGet,
+        status => StatusCode::Ok,
+        body_contains => [],
+        headers => {
+            "NotAHeader" => "Nope"
+        }
+    }
+
+    SimpleGet::check(&response_spec_test_response());
+}
+
+#[test]
+#[should_panic]
+fn test_response_spec_macro_header_wrong_value() {
+    response_spec! {
+        type_name => SimpleGet,
+        status => StatusCode::Ok,
+        body_contains => [],
+        headers => {
+            "Server" => "Nope"
+        }
+    }
+
+    SimpleGet::check(&response_spec_test_response());
 }
