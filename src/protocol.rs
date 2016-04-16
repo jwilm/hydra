@@ -1,14 +1,17 @@
 use std::sync::mpsc;
 use std::fmt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{Cursor, Read};
 
 use solicit::http::frame::{self, Frame, RawFrame, FrameIR, HttpSetting};
 use solicit::http::{HttpScheme, HttpResult, Header, StreamId, ErrorCode};
-use solicit::http::priority::SimplePrioritizer;
+use solicit::http::priority::{DataPrioritizer, SimplePrioritizer};
 use solicit::http::connection::{HttpConnection, SendFrame, ReceiveFrame, HttpFrame, EndStream};
 use solicit::http::connection::SendStatus;
+use solicit::http::connection::DataChunk;
+use solicit::http::HttpError;
 use solicit::http::client::{write_preface, ClientConnection, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
 use solicit::http::session::{self, Stream as SessionStream};
@@ -22,10 +25,132 @@ use StatusCode;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
+/// Extensions to solicit's session::SessionState trait
+// TODO get the writing working with the current trait, then update to use this instead.
+// trait StreamExt {
+    // fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
+// }
+
+/// Result of reading stream outgoing data
+enum StreamDataState {
+    /// Got bytes, call again.
+    More(usize),
+
+    /// Last bytes received
+    Last(usize),
+
+    /// Will check back later for data
+    Unavailable,
+
+    /// Error state will cause stream to be terminated
+    Error,
+}
+
 #[derive(Debug)]
 pub struct Response {
     pub status: ::hyper::status::StatusCode,
     pub headers: Headers,
+}
+
+pub struct StatefulPrioritizer<'a> {
+    /// Session state where streams are stored
+    state: &'a mut DefaultSessionState<Client, Stream>,
+    interest: &'a mut HashSet<StreamId>,
+    buf: &'a mut [u8],
+}
+
+impl<'a> StatefulPrioritizer<'a> {
+    /// Create a StatefulPrioritizer.
+    ///
+    /// Streams will be selected using the interest registry, and stream data will be read from the
+    /// provided State object.
+    pub fn new(state: &'a mut DefaultSessionState<Client, Stream>,
+               interest: &'a mut HashSet<StreamId>,
+               buf: &'a mut [u8]) -> StatefulPrioritizer<'a>
+    {
+        StatefulPrioritizer {
+            state: state,
+            interest: interest,
+            buf: buf,
+        }
+    }
+}
+
+impl<'a> DataPrioritizer for StatefulPrioritizer<'a> {
+    /// Get the first available data chunk, if any.
+    ///
+    /// For each interestd stream_id in self.interest, call get_data_chunk on the stream. If it
+    /// doesn't have data, move on to the next one. If the stream is errored or done providing data,
+    /// remove the id from interested streams. Finally, return the data chunk.
+    fn get_next_chunk(&mut self) -> HttpResult<Option<DataChunk>> {
+
+        // States
+        // ======
+        //
+        // HaveData
+        // HaveDataLast -
+        // WillHaveData
+        // RST
+        //
+        // States where ID should be removed
+        // =================================
+        //
+        // HaveDataLast
+        // RST
+        //
+
+        // Next idea - just have a prioritizer that already has the next data chunk. Streams cannot
+        // be properly reset here.
+        match stream.stream_data(&mut buf) {
+            More(count),
+            Last(count),
+            Unavailable,
+            Error,
+        }
+
+        let (id, res) = self.interest
+            .iter()
+            .map(|id| {
+                debug_assert!(!stream.is_closed_local());
+                (**id, 
+            })
+            .find(|(_id, res)| res != Ok(StreamDataChunk::Unavailable))
+
+
+        for id in self.interest.iter() {
+            let stream = self.state.get_stream_mut(*id).expect("stream exists for id");
+            // A locally closed stream should not be in the interest registry.
+            assert!(!stream.is_closed_local());
+
+            // Read a data chunk from the stream
+            match stream.get_data_chunk(self.buf) {
+                Ok(StreamDataChunk::Last(read)) => {
+                    self.interest.remove(id);
+                    let chunk = DataChunk::new_borrowed(&self.buf[..read], *id, EndStream::Yes);
+                    return Ok(Some(chunk));
+                }
+                Ok(StreamDataChunk::Chunk(read)) => {
+                    let chunk = DataChunk::new_borrowed(&self.buf[..read], *id, EndStream::No);
+                    return Ok(Some(chunk));
+                }
+                Ok(StreamDataChunk::Unavailable) => {
+                    // Stream is still open, but currently has no data that could be sent.
+                    // Pass...
+                }
+                Err(StreamDataError::Closed) => {
+                    // Transition the stream state to be locally closed, so we don't attempt to
+                    // write any more data on this stream.
+                    stream.close_local();
+                    // Find a stream with data to actually write to...
+                }
+                Err(StreamDataError::Other(e)) => {
+                    // Any other error is fatal!
+                    return Err(HttpError::Other(e));
+                }
+            }
+        }
+
+    }
 }
 
 /// Stream events and Request/Response bytes are delivered to/from the handler.
@@ -35,10 +160,8 @@ pub struct Response {
 pub trait StreamHandler: Send + fmt::Debug + 'static {
     /// Provide data from the request body
     ///
-    /// TODO maybe just reexport StreamDataChunk and StreamDataError?
-    /// TODO use this method
-    /// Errors returned from get_data_chunk will result in a stream reset being sent to the server.
-    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
+    /// This will be called repeatedly until one of StreamDataState::{Last, Error} are returned
+    fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
 
     /// Response headers are available
     fn on_response(&mut self, res: Response);
