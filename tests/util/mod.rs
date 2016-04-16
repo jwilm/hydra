@@ -62,6 +62,15 @@ pub struct BufferedResponse {
     pub body: Vec<u8>,
 }
 
+impl fmt::Display for BufferedResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Response\n\
+                   ========\n\
+                   {}\n\
+                   {:?}\n", self.response.headers, ::std::str::from_utf8(&self.body[..]))
+    }
+}
+
 impl<S> Default for ResponseCollector<S> {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
@@ -129,15 +138,6 @@ pub struct HeadersOnlyHandler {
     // outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
     response: Option<hydra::Response>
-}
-
-impl fmt::Display for BufferedResponse {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Response\n\
-                   ========\n\
-                   {}\n\
-                   {:?}\n", self.response.headers, ::std::str::from_utf8(&self.body[..]))
-    }
 }
 
 impl Collectable for HeadersOnlyHandler {
