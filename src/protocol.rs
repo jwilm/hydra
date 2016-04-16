@@ -382,15 +382,12 @@ impl Protocol for Http2 {
         // does not and should not have (as it is passed as a parameter). The proto
         // could use the ref to the evtloop so that it can dispatch messages to it,
         // perhaps even asynchronously.
-        trace!("Hello, from HTTP2");
 
         let mut sender = SendDirect { conn: &mut conn };
         self.send_next_data(&mut sender);
     }
 
     fn notify(&mut self, msg: Msg, mut conn: connection::Ref) {
-        trace!("Http2 notified: msg={:?}", msg);
-
         // A sender is needed for all message variants
         let mut sender = SendDirect { conn: &mut conn };
         match msg {
