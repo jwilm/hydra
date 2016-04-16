@@ -1,5 +1,6 @@
 extern crate hydra;
 extern crate env_logger;
+extern crate hyper;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -35,7 +36,7 @@ fn three_get_streams_one_worker() {
     };
 
     for _ in 0..3 {
-        let req = Request::new_headers_only(Method::Get, "/get");
+        let req = Request::new_headers_only(Method::Get, "/get", Headers::new());
         client.request(req, collector.new_stream_handler());
     }
 
@@ -66,7 +67,7 @@ fn three_workers_three_get_each() {
     match rx.recv().unwrap() {
         ConnectionMsg::Connected(conn) => {
             for _ in 0..3 {
-                let req = Request::new_headers_only(Method::Get, "/get");
+                let req = Request::new_headers_only(Method::Get, "/get", Headers::new());
                 conn.request(req, collector.new_stream_handler());
             }
         },

@@ -1,7 +1,6 @@
 use std::sync::mpsc;
 use std::fmt;
 use std::sync::Arc;
-use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{Cursor, Read};
 
@@ -16,10 +15,18 @@ use solicit::http::session::{self, Stream as SessionStream};
 
 use hyper::header::Headers;
 
-use httparse;
 use connection::{self, DispatchConnectionEvent};
 
+use header;
+use StatusCode;
+
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
+
+#[derive(Debug)]
+pub struct Response {
+    pub status: ::hyper::status::StatusCode,
+    pub headers: Headers,
+}
 
 /// Stream events and Request/Response bytes are delivered to/from the handler.
 ///
@@ -34,7 +41,7 @@ pub trait StreamHandler: Send + fmt::Debug + 'static {
     fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
 
     /// Response headers are available
-    fn on_response_headers(&mut self, res: Headers);
+    fn on_response(&mut self, res: Response);
 
     /// Data from the response is available
     fn on_response_data(&mut self, data: &[u8]);
@@ -116,12 +123,18 @@ pub struct Stream {
 }
 
 impl Stream {
+    #[inline]
     pub fn new(handler: Box<StreamHandler>) -> Stream {
         Stream {
             // TODO should really start in Idle state
             state: session::StreamState::Open,
             inner: handler,
         }
+    }
+
+    #[inline]
+    pub fn on_response(&mut self, res: Response) {
+        self.inner.on_response(res);
     }
 }
 
@@ -130,19 +143,10 @@ impl session::Stream for Stream {
         self.inner.on_response_data(data)
     }
 
+    // TODO need this to optionally return an error so we can handle header parsing failing and the
+    // protocol can reset the stream.
     fn set_headers(&mut self, headers: Vec<Header>) {
-        let httparse_headers = headers.iter().map(|header| {
-            httparse::Header {
-                name: str::from_utf8(&header.name()).unwrap(),
-                value: &header.value(),
-            }
-        }).collect::<Vec<_>>();
-
-        // TODO from_raw does a copy of the httparse::Header values. We can provide owned values,
-        // so the copies are wasteful.
-        let headers = Headers::from_raw(&httparse_headers[..]).unwrap();
-
-        self.inner.on_response_headers(headers)
+        unimplemented!();
     }
 
     fn set_state(&mut self, state: StreamState) {
@@ -211,17 +215,20 @@ impl Http2 {
                   handler: Box<StreamHandler>,
                   scheme: HttpScheme) -> RequestStream<Stream>
     {
-        let ::Request { method, path, headers_only } = request;
+        let ::Request { method, path, headers_only, mut headers } = request;
 
         trace!("new_stream: scheme={:?}, method={}", scheme, method);
 
-        // TODO hyper headers
-        let mut headers: Vec<Header> = vec![
+        headers.set(::hyper::header::UserAgent("hydra/0.0.1".into()));
+
+        let mut solicit_headers: Vec<Header> = vec![
             Header::new(b":method", format!("{}", method).into_bytes()),
             Header::new(b":path", path.into_bytes()),
             Header::new(b":authority", &b"http2bin.org"[..]),
             Header::new(b":scheme", scheme.as_bytes().to_vec()),
         ];
+
+        solicit_headers.extend_from_slice(&header::to_h2(headers)[..]);
 
         let mut stream = Stream::new(handler);
         if headers_only {
@@ -229,7 +236,7 @@ impl Http2 {
         }
 
         RequestStream {
-            headers: headers,
+            headers: solicit_headers,
             stream: stream,
         }
     }
@@ -415,26 +422,24 @@ pub trait RequestDelegate: session::Stream {
 /// a client that streams responses directly into a file on the local file system,
 /// instead of keeping it in memory (like the `DefaultStream` does), without
 /// having to change any HTTP/2-specific logic.
-struct ClientSession<'a, State, G, S>
-    where State: session::SessionState + 'a,
-          S: SendFrame + 'a,
-          G: Settings + 'a
+struct ClientSession<'a, G, S>
+    where S: SendFrame + 'a,
+          G: Settings + 'a,
 {
-    state: &'a mut State,
+    state: &'a mut DefaultSessionState<session::Client, Stream>,
     sender: &'a mut S,
     settings: &'a mut G,
 }
 
-impl<'a, State, G, S> ClientSession<'a, State, G, S>
-    where State: session::SessionState + 'a,
-          S: SendFrame + 'a,
+impl<'a, G, S> ClientSession<'a, G, S>
+    where S: SendFrame + 'a,
           G: Settings + 'a,
 {
     /// Returns a new `ClientSession` associated to the given state.
     #[inline]
-    pub fn new(state: &'a mut State,
+    pub fn new(state: &'a mut DefaultSessionState<session::Client, Stream>,
                sender: &'a mut S,
-               settings: &'a mut G) -> ClientSession<'a, State, G, S>
+               settings: &'a mut G) -> ClientSession<'a, G, S>
     {
         ClientSession {
             state: state,
@@ -444,9 +449,8 @@ impl<'a, State, G, S> ClientSession<'a, State, G, S>
     }
 }
 
-impl<'a, State, G, S> session::Session for ClientSession<'a, State, G, S>
-    where State: session::SessionState + 'a,
-          S: SendFrame + 'a,
+impl<'a, G, S> session::Session for ClientSession<'a, G, S>
+    where S: SendFrame + 'a,
           G: Settings + 'a,
 {
     fn new_data_chunk(&mut self,
@@ -477,17 +481,29 @@ impl<'a, State, G, S> session::Session for ClientSession<'a, State, G, S>
                            _conn: &mut HttpConnection) -> HttpResult<()>
     {
         debug!("Headers for stream {}", stream_id);
-        let mut stream = match self.state.get_stream_mut(stream_id) {
-            None => {
-                debug!("Received a frame for an unknown stream!");
-                // TODO(mlalic): This means that the server's header is not associated to any
-                //               request made by the client nor any server-initiated stream (pushed)
-                return Ok(());
-            }
-            Some(stream) => stream,
-        };
-        // Now let the stream handle the headers
-        stream.set_headers(headers);
+        if let Some(mut stream) = self.state.get_stream_mut(stream_id) {
+            // Now let the stream handle the headers
+            let mut headers = header::to_hyper(headers).unwrap();
+            let status_code = match headers.get_raw(":status") {
+                Some(ref raw_statuses) => {
+                    // raw_statuses is a &[Vec<u8>]
+                    assert!(raw_statuses.len() > 0);
+                    let raw_status_bytes = &raw_statuses[0];
+                    let raw_status_str = ::std::str::from_utf8(&raw_status_bytes[..]).unwrap();
+                    let raw_status_num = raw_status_str.parse::<u16>().unwrap();
+                    StatusCode::from_u16(raw_status_num)
+                },
+                _ => unimplemented!()
+            };
+
+            // :status is a pseudo header that shouldn't be available in the application
+            headers.remove_raw(":status");
+
+            stream.on_response(Response {
+                headers: headers,
+                status: status_code,
+            });
+        }
         Ok(())
     }
 
