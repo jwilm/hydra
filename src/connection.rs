@@ -189,7 +189,7 @@ impl Connection {
 
     fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) {
         let mut flags = mio::EventSet::readable();
-        if !self.backlog.is_empty() {
+        if !self.backlog.is_empty() || self.protocol.wants_write() {
             flags = flags | mio::EventSet::writable();
         }
 
@@ -198,8 +198,6 @@ impl Connection {
     }
 
     pub fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
-        trace!("Connection notified: token={:?}; msg={:?}", self.token, msg);
-
         {
             let conn_ref = Ref {
                 event_loop: event_loop,
@@ -305,7 +303,6 @@ impl Connection {
                 match self.stream.try_write_buf(buf) {
                     Ok(Some(_)) if buf.get_ref().len() == buf.position() as usize => {
                         trace!("Full frame written!");
-                        trace!("{:?}", buf);
                         WriteStatus::Full
                     },
                     Ok(Some(sz)) => {

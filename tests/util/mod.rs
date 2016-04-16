@@ -7,6 +7,7 @@ use std::sync::mpsc;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
 use hydra::StatusCode;
+use hydra::StreamDataState;
 
 
 /// Messages sent by ConnectHandler
@@ -159,9 +160,7 @@ impl hydra::StreamHandler for HeadersOnlyHandler {
         self.body.extend_from_slice(bytes);
     }
 
-    fn get_data_chunk(&mut self, buf: &mut [u8])
-        -> Result<protocol::StreamDataChunk, protocol::StreamDataError>
-    {
+    fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
         unimplemented!();
     }
 
@@ -183,6 +182,96 @@ impl hydra::StreamHandler for HeadersOnlyHandler {
         })).unwrap();
     }
 }
+
+pub trait GetBody : fmt::Debug + Send + 'static {
+    fn get_body() -> Vec<u8>;
+}
+
+#[derive(Debug)]
+pub struct HelloWorld;
+
+impl GetBody for HelloWorld {
+    fn get_body() -> Vec<u8> {
+        "Hello, world!".as_bytes().to_vec()
+    }
+}
+
+#[derive(Debug)]
+pub struct BodyWriter<G: GetBody> {
+    tx: mpsc::Sender<Option<BufferedResponse>>,
+    outgoing: Cursor<Vec<u8>>,
+    body: Vec<u8>,
+    response: Option<hydra::Response>,
+    _marker: PhantomData<G>,
+}
+
+impl<G> Collectable for BodyWriter<G>
+    where G: GetBody,
+{
+    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> BodyWriter<G> {
+        BodyWriter {
+            tx: tx,
+            body: Vec::new(),
+            response: None,
+            outgoing: Cursor::new(G::get_body()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<G> hydra::StreamHandler for BodyWriter<G>
+    where G: GetBody,
+{
+    fn on_error(&mut self, _err: hydra::RequestError) {
+        self.tx.send(None).unwrap();
+    }
+
+    fn on_response_data(&mut self, bytes: &[u8]) {
+        self.body.extend_from_slice(bytes);
+    }
+
+    fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
+        use std::io::Read;
+
+        let read = match self.outgoing.read(buf) {
+            Ok(count) => count,
+            Err(err) => return StreamDataState::error(),
+        };
+        let pos = self.outgoing.position() as usize;
+        let total = self.outgoing.get_ref().len();
+
+        if total == pos {
+            StreamDataState::done(read)
+        } else {
+            StreamDataState::read(read)
+        }
+    }
+
+    /// Response headers are available
+    fn on_response(&mut self, res: hydra::Response) {
+        self.response = Some(res);
+    }
+
+    /// Called when the stream is closed (complete)
+    fn on_close(&mut self) {
+        let mut res = Vec::new();
+        ::std::mem::swap(&mut self.body, &mut res);
+
+        let response = self.response.take().unwrap();
+
+        self.tx.send(Some(BufferedResponse {
+            response: response,
+            body: res,
+        })).unwrap();
+    }
+}
+
+pub fn maybe_env_logger() {
+    if ::std::env::var("HYDRA_LOG").is_ok() {
+        ::env_logger::init().ok();
+    }
+}
+
 
 /// Trait for checking responses; consumed by Collector.check_responses
 ///

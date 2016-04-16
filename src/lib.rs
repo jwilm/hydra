@@ -36,6 +36,7 @@ use worker::Worker;
 
 pub use protocol::StreamHandler;
 pub use protocol::Response;
+pub use protocol::StreamDataState;
 
 pub use connection::Handler as ConnectionHandler;
 

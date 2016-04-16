@@ -3,6 +3,12 @@ TODO
 
 # What I was doing when I stepped away
 
+About to write a HydraPrioritizer/StatefulPrioritizer etc which tracks which
+streams have an interest. Tracking write interest is critical for continuing to
+get writable events from the loop. Let's also utilize the tick function to
+buffer stream outgoing data so that it can be written immediately at the next
+write.
+
 # MVP TODOs
 
 * stream errors send RST_STREAM. I assume this already happens internally with

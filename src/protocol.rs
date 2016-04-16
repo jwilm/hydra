@@ -1,14 +1,17 @@
 use std::sync::mpsc;
 use std::fmt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{Cursor, Read};
 
 use solicit::http::frame::{self, Frame, RawFrame, FrameIR, HttpSetting};
 use solicit::http::{HttpScheme, HttpResult, Header, StreamId, ErrorCode};
-use solicit::http::priority::SimplePrioritizer;
+use solicit::http::priority::{DataPrioritizer, SimplePrioritizer};
 use solicit::http::connection::{HttpConnection, SendFrame, ReceiveFrame, HttpFrame, EndStream};
 use solicit::http::connection::SendStatus;
+use solicit::http::connection::DataChunk;
+use solicit::http::HttpError;
 use solicit::http::client::{write_preface, ClientConnection, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
 use solicit::http::session::{self, Stream as SessionStream};
@@ -22,10 +25,96 @@ use StatusCode;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
+/// Extensions to solicit's session::SessionState trait
+// TODO get the writing working with the current trait, then update to use this instead.
+// trait StreamExt {
+    // fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
+// }
+
+
+/// Upon successfully reading from a stream, ReadInfo is provided in the StreamDataState
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReadInfo {
+    Pending(usize),
+    End(usize),
+}
+
+/// Result of reading stream outgoing data
+#[derive(Eq, PartialEq, Debug)]
+pub enum StreamDataState {
+    /// Have bytes to send
+    Read(ReadInfo),
+
+    /// Will check back later for data
+    Unavailable,
+
+    /// Cannot continue due to error
+    ///
+    /// Returning this will terminate the stream immediately.
+    Error,
+}
+
+impl StreamDataState {
+    pub fn done(bytes: usize) -> StreamDataState {
+        StreamDataState::Read(ReadInfo::End(bytes))
+    }
+
+    pub fn read(bytes: usize) -> StreamDataState {
+        StreamDataState::Read(ReadInfo::Pending(bytes))
+    }
+
+    pub fn unavailable() -> StreamDataState {
+        StreamDataState::Unavailable
+    }
+
+    pub fn error() -> StreamDataState {
+        StreamDataState::Error
+    }
+}
+
+/// Type returned from stream_data
+///
+/// Contains a stream_id and its state.
+struct StreamResult {
+    id: StreamId,
+    state: StreamDataState,
+}
+
 #[derive(Debug)]
 pub struct Response {
     pub status: ::hyper::status::StatusCode,
     pub headers: Headers,
+}
+
+/// Prioritizer where the buffer is already provided and filled; it just needs to be returned from
+/// the data chunk.
+pub struct BufferPrioritizer<'a> {
+    /// Session state where streams are stored
+    buf: &'a mut [u8],
+    end: EndStream,
+    id: StreamId,
+}
+
+impl<'a> BufferPrioritizer<'a> {
+    /// Create a BufferPrioritizer.
+    ///
+    /// Streams will be selected using the interest registry, and stream data will be read from the
+    /// provided State object.
+    pub fn new(id: StreamId, buf: &'a mut [u8], end: EndStream) -> BufferPrioritizer<'a>
+    {
+        BufferPrioritizer {
+            buf: buf,
+            end: end,
+            id: id,
+        }
+    }
+}
+
+impl<'a> DataPrioritizer for BufferPrioritizer<'a> {
+    /// Provide the wrapped buffer
+    fn get_next_chunk(&mut self) -> HttpResult<Option<DataChunk>> {
+        Ok(Some(DataChunk::new_borrowed(&self.buf[..], self.id, self.end)))
+    }
 }
 
 /// Stream events and Request/Response bytes are delivered to/from the handler.
@@ -35,10 +124,8 @@ pub struct Response {
 pub trait StreamHandler: Send + fmt::Debug + 'static {
     /// Provide data from the request body
     ///
-    /// TODO maybe just reexport StreamDataChunk and StreamDataError?
-    /// TODO use this method
-    /// Errors returned from get_data_chunk will result in a stream reset being sent to the server.
-    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError>;
+    /// This will be called repeatedly until one of StreamDataState::{Last, Error} are returned
+    fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
 
     /// Response headers are available
     fn on_response(&mut self, res: Response);
@@ -136,6 +223,10 @@ impl Stream {
     pub fn on_response(&mut self, res: Response) {
         self.inner.on_response(res);
     }
+
+    pub fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
+        self.inner.stream_data(buf)
+    }
 }
 
 impl session::Stream for Stream {
@@ -158,7 +249,7 @@ impl session::Stream for Stream {
     }
 
     fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError> {
-        self.inner.get_data_chunk(buf)
+        unreachable!();
     }
 
     /// Returns the current state of the stream.
@@ -175,6 +266,9 @@ pub struct Http2 {
 
     /// Dynamic protocol configuration
     settings: Http2Settings,
+
+    /// Streams with active interest in writing data
+    interest: HashSet<StreamId>,
 }
 
 /// Settings type that exposes some properties via Send/Sync types
@@ -276,6 +370,12 @@ impl Http2 {
         };
 
         let stream_id = self.state.insert_outgoing(req.stream);
+
+        if end_stream == EndStream::No {
+            // mark stream as interested in writing
+            self.interest.insert(stream_id);
+        }
+
         try!(self.conn.sender(sender).send_headers(req.headers, stream_id, end_stream));
 
         debug!("CreatedStream {:?}", stream_id);
@@ -304,13 +404,59 @@ impl Http2 {
     /// Currently, no prioritization of streams is taken into account and which stream's data is
     /// queued cannot be relied on.
     pub fn send_next_data<S: SendFrame>(&mut self, sender: &mut S) -> HttpResult<SendStatus> {
-        debug!("Sending next data...");
+        trace!("Http2::send_next_data");
         // A default "maximum" chunk size of 8 KiB is set on all data frames.
-        const MAX_CHUNK_SIZE: usize = 8 * 1024;
+        const MAX_CHUNK_SIZE: usize = 8_192;
         let mut buf = [0; MAX_CHUNK_SIZE];
 
-        let mut prioritizer = SimplePrioritizer::new(&mut self.state, &mut buf);
-        self.conn.sender(sender).send_next_data(&mut prioritizer)
+        if let Some(stream_result) = Http2::get_stream_data(&self.interest,
+                                                            &mut self.state, &mut buf[..]) {
+            let id = stream_result.id;
+
+            match stream_result.state {
+                StreamDataState::Read(info) => {
+                    trace!("send_next_data: got bytes for stream {}", id);
+                    // Remove stream from interest if it's done providing data
+                    let (bytes, end) = match info {
+                        ReadInfo::Pending(bytes) => (bytes, EndStream::No),
+                        ReadInfo::End(bytes) => {
+                            self.interest.remove(&id);
+                            (bytes, EndStream::Yes)
+                        }
+                    };
+
+                    // TODO close stream on 0 bytes
+                    if bytes == 0 {
+                        return Ok(SendStatus::Nothing);
+                    }
+
+                    let mut prioritizer = BufferPrioritizer::new(id, &mut buf[..bytes], end);
+                    try!(self.conn.sender(sender).send_next_data(&mut prioritizer));
+                    return Ok(SendStatus::Sent);
+                },
+                // TODO this should only need to handle errors and reads. Nothing is returned in the
+                // case of Unavailable.
+                StreamDataState::Unavailable => unreachable!(),
+                StreamDataState::Error => unimplemented!(),
+            }
+        }
+
+        Ok(SendStatus::Nothing)
+    }
+
+    fn get_stream_data(interest: &HashSet<StreamId>,
+                       state: &mut DefaultSessionState<session::Client, Stream>,
+                       buf: &mut [u8]) -> Option<StreamResult> {
+        interest.iter()
+            .map(|id| {
+                let stream = state.get_stream_mut(*id).expect("interest stream in state");
+                debug_assert!(!stream.is_closed_local());
+                StreamResult {
+                    id: *id,
+                    state: stream.stream_data(buf),
+                }
+            })
+            .find(|res| res.state != StreamDataState::Unavailable)
     }
 
     pub fn initialize(&mut self, mut conn: connection::Ref) {
@@ -318,6 +464,10 @@ impl Http2 {
         let mut buf = Vec::new();
         write_preface(&mut buf).unwrap();
         conn.queue_frame(buf);
+    }
+
+    pub fn wants_write(&self) -> bool {
+        !self.interest.is_empty()
     }
 }
 
@@ -331,6 +481,7 @@ impl Protocol for Http2 {
             settings: Default::default(),
             got_settings: false,
             state: state,
+            interest: HashSet::new(),
         }
     }
 
@@ -382,15 +533,12 @@ impl Protocol for Http2 {
         // does not and should not have (as it is passed as a parameter). The proto
         // could use the ref to the evtloop so that it can dispatch messages to it,
         // perhaps even asynchronously.
-        trace!("Hello, from HTTP2");
 
         let mut sender = SendDirect { conn: &mut conn };
         self.send_next_data(&mut sender);
     }
 
     fn notify(&mut self, msg: Msg, mut conn: connection::Ref) {
-        trace!("Http2 notified: msg={:?}", msg);
-
         // A sender is needed for all message variants
         let mut sender = SendDirect { conn: &mut conn };
         match msg {
