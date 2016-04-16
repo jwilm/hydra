@@ -1,7 +1,10 @@
+//! Helpers for writing Hydra tests
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
+use hydra::StatusCode;
 
 /// Messages sent by ConnectHandler
 pub enum ConnectionMsg {
@@ -44,9 +47,14 @@ impl connection::Handler for ConnectHandler {
 /// StreamHandler that is needed (one per request). The `wait_all` function is used to block until
 /// all of the streams have been resolved through any means (nominally, error, etc).
 pub struct ResponseCollector {
-    rx: mpsc::Receiver<Option<Vec<u8>>>,
-    tx: mpsc::Sender<Option<Vec<u8>>>,
+    rx: mpsc::Receiver<Option<BufferedResponse>>,
+    tx: mpsc::Sender<Option<BufferedResponse>>,
     counter: AtomicUsize,
+}
+
+pub struct BufferedResponse {
+    response: hydra::Response,
+    body: Vec<u8>,
 }
 
 impl Default for ResponseCollector {
@@ -82,7 +90,16 @@ impl ResponseCollector {
         while self.counter.load(Ordering::SeqCst) != 0 {
             let msg = self.rx.recv().unwrap();
             self.counter.fetch_sub(1, Ordering::SeqCst);
-            println!("resp: {:?}", msg);
+            if let Some(buffered) = msg {
+                println!("{}", buffered);
+
+                let headers = &buffered.response.headers;
+                let server = headers.get::<::hyper::header::Server>().unwrap();
+                assert!(server.contains("h2o"));
+
+                let status = buffered.response.status;
+                assert_eq!(status, StatusCode::Ok);
+            }
         }
     }
 }
@@ -93,16 +110,27 @@ impl ResponseCollector {
 /// to `new`.
 #[derive(Debug)]
 pub struct StreamHandler {
-    tx: mpsc::Sender<Option<Vec<u8>>>,
-    res: Vec<u8>,
+    tx: mpsc::Sender<Option<BufferedResponse>>,
+    body: Vec<u8>,
+    response: Option<hydra::Response>
+}
+
+impl fmt::Display for BufferedResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Response\n\
+                   ========\n\
+                   {}\n\
+                   {:?}\n", self.response.headers, ::std::str::from_utf8(&self.body[..]))
+    }
 }
 
 impl StreamHandler {
-    pub fn new(tx: mpsc::Sender<Option<Vec<u8>>>) -> StreamHandler
+    pub fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> StreamHandler
     {
         StreamHandler {
             tx: tx,
-            res: Vec::new()
+            body: Vec::new(),
+            response: None,
         }
     }
 }
@@ -113,7 +141,7 @@ impl hydra::StreamHandler for StreamHandler {
     }
 
     fn on_response_data(&mut self, bytes: &[u8]) {
-        self.res.extend_from_slice(bytes);
+        self.body.extend_from_slice(bytes);
     }
 
     fn get_data_chunk(&mut self, buf: &mut [u8])
@@ -123,15 +151,20 @@ impl hydra::StreamHandler for StreamHandler {
     }
 
     /// Response headers are available
-    fn on_response_headers(&mut self, res: Headers) {
-        println!("headers: {:?}", res);
+    fn on_response(&mut self, res: hydra::Response) {
+        self.response = Some(res);
     }
 
     /// Called when the stream is closed (complete)
     fn on_close(&mut self) {
         let mut res = Vec::new();
-        ::std::mem::swap(&mut self.res, &mut res);
+        ::std::mem::swap(&mut self.body, &mut res);
 
-        self.tx.send(Some(res)).unwrap();
+        let response = self.response.take().unwrap();
+
+        self.tx.send(Some(BufferedResponse {
+            response: response,
+            body: res,
+        })).unwrap();
     }
 }

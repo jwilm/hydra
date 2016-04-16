@@ -21,7 +21,7 @@ use std::io;
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
 pub use hyper::status::{StatusCode, StatusClass};
-pub use hyper::header::{self, Headers};
+pub use hyper::header::{Headers};
 
 use solicit::http::session;
 
@@ -30,9 +30,13 @@ pub mod util;
 pub mod protocol;
 pub mod connection;
 
+mod header;
+
 use worker::Worker;
 
 pub use protocol::StreamHandler;
+pub use protocol::Response;
+
 pub use connection::Handler as ConnectionHandler;
 
 pub trait Connector: Send + 'static {}
@@ -133,35 +137,34 @@ impl<'a> Client<'a> {
 #[derive(Debug)]
 pub struct Request {
     method: Method,
+    headers: Headers,
     path: String,
     headers_only: bool,
 }
 
 impl Request {
-    pub fn new<P>(method: Method, path: P) -> Request
+    pub fn new<P>(method: Method, path: P, headers: Headers) -> Request
         where P: Into<String>,
     {
-        // TODO headers
         Request {
             method: method,
             path: path.into(),
             headers_only: false,
+            headers: headers,
         }
     }
-pub fn new_headers_only<P>(method: Method, path: P) -> Request
+
+    pub fn new_headers_only<P>(method: Method, path: P, headers: Headers) -> Request
         where P: Into<String>,
     {
-        // TODO headers - either here or via the handler. I'm inclined to say the handler.
         Request {
             method: method,
             path: path.into(),
             headers_only: true,
+            headers: headers,
         }
     }
 }
-
-#[derive(Debug)]
-pub struct Response;
 
 #[derive(Debug)]
 pub enum ConnectionError {
