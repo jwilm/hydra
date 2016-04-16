@@ -3,13 +3,8 @@ TODO
 
 # What I was doing when I stepped away
 
-Just made HTTP requests successfully! Added a reregister function that may be
-super suboptimal when handling many notifications.
-
 # MVP TODOs
 
-* Resolve mpsc::Sender vs mio::Sender use for worker / event loop messages
-    * Fuck it, everything can just use the mio::Sender.
 * stream errors send RST_STREAM. I assume this already happens internally with
   the protocol, but if reading data for an outgoing stream payload fails, that
   would need to happen manually.
@@ -22,6 +17,14 @@ super suboptimal when handling many notifications.
 * TLS connections
 * Shutdown cleanup so everything can finish as much as possible.
 
-# Additional TODOs
+# Nice to haves
 
-- Async DNS lookup the proper way
+* Write a macro for building a type, implementing StreamHandler, and running
+  tests given a spec defined in the macro invocation. Sadly, I think this
+  probably will require procedural macros or a compiler extension. Maybe that's
+  ok since it's just for testing. Could use syntex to do the codegen.
+
+# Version 1.0
+
+* Async DNS lookup the proper way
+* Optimize event loop reregistration
