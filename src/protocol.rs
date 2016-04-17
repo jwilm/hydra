@@ -31,19 +31,51 @@ pub use solicit::http::session::{StreamDataChunk, StreamDataError};
     // fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
 // }
 
-/// Result of reading stream outgoing data
-enum StreamDataState {
-    /// Got bytes, call again.
-    More(usize),
 
-    /// Last bytes received
-    Last(usize),
+/// Upon successfully reading from a stream, ReadInfo is provided in the StreamDataState
+pub enum ReadInfo {
+    Pending(usize),
+    End(usize),
+}
+
+/// Result of reading stream outgoing data
+pub enum StreamDataState {
+    /// Have bytes to send
+    Read(ReadInfo),
 
     /// Will check back later for data
     Unavailable,
 
-    /// Error state will cause stream to be terminated
+    /// Cannot continue due to error
+    ///
+    /// Returning this will terminate the stream immediately.
     Error,
+}
+
+impl StreamDataState {
+    pub fn done(bytes: usize) -> StreamDataState {
+        StreamDataState::Read(ReadInfo::End(bytes))
+    }
+
+    pub fn read(bytes: usize) -> StreamDataState {
+        StreamDataState::Read(ReadInfo::Pending(bytes))
+    }
+
+    pub fn unavailable() -> StreamDataState {
+        StreamDataState::Unavailable
+    }
+
+    pub fn error() -> StreamDataState {
+        StreamDataState::Error
+    }
+}
+
+/// Type returned from stream_data
+///
+/// Contains a stream_id and its state.
+struct StreamResult {
+    id: StreamId,
+    state: StreamDataState,
 }
 
 #[derive(Debug)]
@@ -52,104 +84,34 @@ pub struct Response {
     pub headers: Headers,
 }
 
-pub struct StatefulPrioritizer<'a> {
+/// Prioritizer where the buffer is already provided and filled; it just needs to be returned from
+/// the data chunk.
+pub struct BufferPrioritizer<'a> {
     /// Session state where streams are stored
-    state: &'a mut DefaultSessionState<Client, Stream>,
-    interest: &'a mut HashSet<StreamId>,
     buf: &'a mut [u8],
+    end: EndStream,
+    id: StreamId,
 }
 
-impl<'a> StatefulPrioritizer<'a> {
-    /// Create a StatefulPrioritizer.
+impl<'a> BufferPrioritizer<'a> {
+    /// Create a BufferPrioritizer.
     ///
     /// Streams will be selected using the interest registry, and stream data will be read from the
     /// provided State object.
-    pub fn new(state: &'a mut DefaultSessionState<Client, Stream>,
-               interest: &'a mut HashSet<StreamId>,
-               buf: &'a mut [u8]) -> StatefulPrioritizer<'a>
+    pub fn new(id: StreamId, buf: &'a mut [u8], end: EndStream) -> BufferPrioritizer<'a>
     {
-        StatefulPrioritizer {
-            state: state,
-            interest: interest,
+        BufferPrioritizer {
             buf: buf,
+            end: end,
+            id: id,
         }
     }
 }
 
-impl<'a> DataPrioritizer for StatefulPrioritizer<'a> {
-    /// Get the first available data chunk, if any.
-    ///
-    /// For each interestd stream_id in self.interest, call get_data_chunk on the stream. If it
-    /// doesn't have data, move on to the next one. If the stream is errored or done providing data,
-    /// remove the id from interested streams. Finally, return the data chunk.
+impl<'a> DataPrioritizer for BufferPrioritizer<'a> {
+    /// Provide the wrapped buffer
     fn get_next_chunk(&mut self) -> HttpResult<Option<DataChunk>> {
-
-        // States
-        // ======
-        //
-        // HaveData
-        // HaveDataLast -
-        // WillHaveData
-        // RST
-        //
-        // States where ID should be removed
-        // =================================
-        //
-        // HaveDataLast
-        // RST
-        //
-
-        // Next idea - just have a prioritizer that already has the next data chunk. Streams cannot
-        // be properly reset here.
-        match stream.stream_data(&mut buf) {
-            More(count),
-            Last(count),
-            Unavailable,
-            Error,
-        }
-
-        let (id, res) = self.interest
-            .iter()
-            .map(|id| {
-                debug_assert!(!stream.is_closed_local());
-                (**id, 
-            })
-            .find(|(_id, res)| res != Ok(StreamDataChunk::Unavailable))
-
-
-        for id in self.interest.iter() {
-            let stream = self.state.get_stream_mut(*id).expect("stream exists for id");
-            // A locally closed stream should not be in the interest registry.
-            assert!(!stream.is_closed_local());
-
-            // Read a data chunk from the stream
-            match stream.get_data_chunk(self.buf) {
-                Ok(StreamDataChunk::Last(read)) => {
-                    self.interest.remove(id);
-                    let chunk = DataChunk::new_borrowed(&self.buf[..read], *id, EndStream::Yes);
-                    return Ok(Some(chunk));
-                }
-                Ok(StreamDataChunk::Chunk(read)) => {
-                    let chunk = DataChunk::new_borrowed(&self.buf[..read], *id, EndStream::No);
-                    return Ok(Some(chunk));
-                }
-                Ok(StreamDataChunk::Unavailable) => {
-                    // Stream is still open, but currently has no data that could be sent.
-                    // Pass...
-                }
-                Err(StreamDataError::Closed) => {
-                    // Transition the stream state to be locally closed, so we don't attempt to
-                    // write any more data on this stream.
-                    stream.close_local();
-                    // Find a stream with data to actually write to...
-                }
-                Err(StreamDataError::Other(e)) => {
-                    // Any other error is fatal!
-                    return Err(HttpError::Other(e));
-                }
-            }
-        }
-
+        Ok(Some(DataChunk::new_borrowed(self.buf, self.id, self.end)))
     }
 }
 
@@ -259,6 +221,10 @@ impl Stream {
     pub fn on_response(&mut self, res: Response) {
         self.inner.on_response(res);
     }
+
+    pub fn stream_data(&mut self, buf: &mut [u8]) -> StreamResult {
+        self.inner.stream_data(buf)
+    }
 }
 
 impl session::Stream for Stream {
@@ -298,6 +264,9 @@ pub struct Http2 {
 
     /// Dynamic protocol configuration
     settings: Http2Settings,
+
+    /// Streams with active interest in writing data
+    interest: HashSet<StreamId>,
 }
 
 /// Settings type that exposes some properties via Send/Sync types
@@ -399,6 +368,12 @@ impl Http2 {
         };
 
         let stream_id = self.state.insert_outgoing(req.stream);
+
+        if end_stream == EndStream::No {
+            // mark stream as interested in writing
+            self.interest.insert(stream_id);
+        }
+
         try!(self.conn.sender(sender).send_headers(req.headers, stream_id, end_stream));
 
         debug!("CreatedStream {:?}", stream_id);
@@ -432,8 +407,48 @@ impl Http2 {
         const MAX_CHUNK_SIZE: usize = 8 * 1024;
         let mut buf = [0; MAX_CHUNK_SIZE];
 
-        let mut prioritizer = SimplePrioritizer::new(&mut self.state, &mut buf);
-        self.conn.sender(sender).send_next_data(&mut prioritizer)
+        if let Some(stream_result) = self.get_stream_data(buf) {
+            let id = stream_result.id;
+
+            match stream_result.state {
+                StreamDataState::Read(info) => {
+                    // Remove stream from interest if it's done providing data
+                    let (bytes, end) = match info {
+                        ReadInfo::Pending(bytes) => (bytes, EndStream::No),
+                        ReadInfo::End(bytes) => {
+                            self.interest.remove(id);
+                            (bytes, EndStream::Yes)
+                        }
+                    };
+
+                    // TODO close stream on 0 bytes
+                    if bytes == 0 {
+                        return Ok(SendStatus::Nothing);
+                    }
+
+                    let mut prioritizer = BufferPrioritizer::new(id, &mut buf[..bytes], end);
+                    try!(self.conn.sender(sender).send_next_data(&mut prioritizer));
+                    return Ok(SendStatus::Sent);
+                },
+                StreamDataState::Error => {
+                    unimplemented!();
+                }
+            }
+        }
+
+    }
+
+    fn get_stream_data(&mut self, buf: &mut [u8]) -> Option<StreamResult> {
+        self.interest.iter()
+            .map(|id| {
+                let stream = self.state.get_stream_mut(*id);
+                debug_assert!(!stream.is_closed_local());
+                StreamResult {
+                    id: id,
+                    status: stream.stream_data(self.buf),
+                }
+            })
+            .find(|res| res.status != StreamDataState::Unavailable)
     }
 
     pub fn initialize(&mut self, mut conn: connection::Ref) {

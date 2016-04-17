@@ -7,6 +7,7 @@ use std::sync::mpsc;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
 use hydra::StatusCode;
+use hydra::StreamDataState;
 
 
 /// Messages sent by ConnectHandler
@@ -231,9 +232,7 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
         self.body.extend_from_slice(bytes);
     }
 
-    fn get_data_chunk(&mut self, buf: &mut [u8])
-        -> Result<protocol::StreamDataChunk, protocol::StreamDataError>
-    {
+    fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
         use std::io::Read;
 
         let read = try!(self.outgoing.read(buf));
@@ -244,11 +243,16 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
 
         if total == pos {
             println!("last");
-            Ok(protocol::StreamDataChunk::Last(read))
+            StreamDataState::done(read)
         } else {
             println!("chunk");
-            Ok(protocol::StreamDataChunk::Chunk(read))
+            StreamDataState::read(read)
         }
+    }
+
+    fn get_data_chunk(&mut self, buf: &mut [u8])
+        -> Result<protocol::StreamDataChunk, protocol::StreamDataError>
+    {
     }
 
     /// Response headers are available
