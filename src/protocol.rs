@@ -227,6 +227,10 @@ impl Stream {
     pub fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
         self.inner.stream_data(buf)
     }
+
+    fn on_error(&mut self, err: super::RequestError) {
+        self.inner.on_error(err)
+    }
 }
 
 impl session::Stream for Stream {
@@ -256,7 +260,6 @@ impl session::Stream for Stream {
     fn state(&self) -> StreamState {
         self.state
     }
-
 }
 
 pub struct Http2 {
@@ -437,11 +440,39 @@ impl Http2 {
                 // TODO this should only need to handle errors and reads. Nothing is returned in the
                 // case of Unavailable.
                 StreamDataState::Unavailable => unreachable!(),
-                StreamDataState::Error => unimplemented!(),
+                StreamDataState::Error => {
+                    try!(self.rst_stream(id, ErrorCode::InternalError, sender));
+                },
             }
         }
 
         Ok(SendStatus::Nothing)
+    }
+
+    /// Initiate a stream reset
+    ///
+    /// Processing the stream identified by `id` has failed locally. Send a RST_STREAM frame to our
+    /// peer, remove the stream from the state machine, and run the on_error callback for the
+    /// stream.
+    fn rst_stream<S: SendFrame>(&mut self,
+                                id: StreamId,
+                                code: ErrorCode,
+                                sender: &mut S) -> HttpResult<()>
+    {
+        // Send RST_STREAM frame
+        try!(self.conn.sender(sender).rst_stream(id, code));
+
+        // Don't try and stream data
+        self.interest.remove(&id);
+
+        // Remove stream from the session state
+        if let Some(mut stream) = self.state.remove_stream(id) {
+            // Run the on_error callback saying that is closed due to error returnd from the
+            // handler.
+            stream.on_error(super::RequestError::User);
+        }
+
+        Ok(())
     }
 
     fn get_stream_data(interest: &HashSet<StreamId>,

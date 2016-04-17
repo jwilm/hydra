@@ -72,10 +72,18 @@ pub struct ResponseCollector<S> {
     _marker: PhantomData<S>
 }
 
-#[derive(Debug)]
 pub struct BufferedResponse {
     pub response: hydra::Response,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for BufferedResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("BufferedResponse")
+            .field("response", &self.response)
+            .field("body", &::std::str::from_utf8(&self.body[..]))
+            .finish()
+    }
 }
 
 impl fmt::Display for BufferedResponse {
@@ -97,6 +105,12 @@ impl<S> Default for ResponseCollector<S> {
             messages: Vec::new(),
             _marker: PhantomData
         }
+    }
+}
+
+impl<S> ResponseCollector<S> {
+    pub fn messages(&self) -> &[StreamMsg] {
+        &self.messages[..]
     }
 }
 
@@ -143,6 +157,52 @@ pub trait Collectable: hydra::StreamHandler {
     fn new(tx: mpsc::Sender<StreamMsg>) -> Self;
 }
 
+/// Implementor of hydra::StreamHandler; returns an error in `stream_data`.
+#[derive(Debug)]
+pub struct HandlerStreamError {
+    tx: mpsc::Sender<StreamMsg>,
+    body: Vec<u8>,
+    response: Option<hydra::Response>,
+    generated_error: bool,
+}
+
+impl Collectable for HandlerStreamError {
+    fn new(tx: mpsc::Sender<StreamMsg>) -> HandlerStreamError {
+        HandlerStreamError {
+            tx: tx,
+            body: Vec::new(),
+            response: None,
+            generated_error: false,
+        }
+    }
+}
+
+impl hydra::StreamHandler for HandlerStreamError {
+    fn on_error(&mut self, err: hydra::RequestError) {
+        self.tx.send(StreamMsg::Error(err)).unwrap();
+    }
+
+    fn on_response_data(&mut self, _bytes: &[u8]) {
+        unreachable!();
+    }
+
+    fn stream_data(&mut self, _buf: &mut [u8]) -> StreamDataState {
+        assert!(!self.generated_error);
+        self.generated_error = true;
+        StreamDataState::error()
+    }
+
+    /// Response headers are available
+    fn on_response(&mut self, _res: hydra::Response) {
+        unreachable!();
+    }
+
+    /// Called when the stream is closed (complete)
+    fn on_close(&mut self) {
+        unreachable!();
+    }
+}
+
 /// Implementor of hydra::StreamHandler; receives stream events
 ///
 /// When an error occurs or the stream terminates normally, an event is sent on the channel passed
@@ -150,7 +210,6 @@ pub trait Collectable: hydra::StreamHandler {
 #[derive(Debug)]
 pub struct HeadersOnlyHandler {
     tx: mpsc::Sender<StreamMsg>,
-    // outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
     response: Option<hydra::Response>
 }
@@ -280,10 +339,8 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
     }
 }
 
-pub fn maybe_env_logger() {
-    if ::std::env::var("HYDRA_LOG").is_ok() {
-        ::env_logger::init().ok();
-    }
+pub fn enable_logging() {
+    ::env_logger::init().ok();
 }
 
 

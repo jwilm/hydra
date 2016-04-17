@@ -3,11 +3,9 @@ TODO
 
 # What I was doing when I stepped away
 
-About to write a HydraPrioritizer/StatefulPrioritizer etc which tracks which
-streams have an interest. Tracking write interest is critical for continuing to
-get writable events from the loop. Let's also utilize the tick function to
-buffer stream outgoing data so that it can be written immediately at the next
-write.
+Just noticed that StreamHandlers in tests are pretty much always the same save
+for the `stream_data` method. Maybe worth writing a macro to define these
+things, too!.
 
 # MVP TODOs
 
