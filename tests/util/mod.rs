@@ -2,7 +2,6 @@
 use std::fmt;
 use std::io::Cursor;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use hydra::{self, Method, Request, connection, protocol, Headers};
@@ -53,7 +52,7 @@ impl connection::Handler for ConnectHandler {
 pub struct ResponseCollector<S> {
     rx: mpsc::Receiver<Option<BufferedResponse>>,
     tx: mpsc::Sender<Option<BufferedResponse>>,
-    counter: AtomicUsize,
+    counter: usize,
     responses: Vec<BufferedResponse>,
     _marker: PhantomData<S>
 }
@@ -78,7 +77,7 @@ impl<S> Default for ResponseCollector<S> {
         ResponseCollector {
             rx: rx,
             tx: tx,
-            counter: AtomicUsize::new(0),
+            counter: 0,
             responses: Vec::new(),
             _marker: PhantomData
         }
@@ -94,8 +93,8 @@ impl<S: Collectable> ResponseCollector<S> {
     /// Get a stream handler
     ///
     /// Returns a StreamHandler and increments the number of responses `wait_all` expects
-    pub fn new_stream_handler(&self) -> S {
-        self.counter.fetch_add(1, Ordering::Relaxed);
+    pub fn new_stream_handler(&mut self) -> S {
+        self.counter += 1;
 
         S::new(self.tx.clone())
     }
@@ -104,9 +103,9 @@ impl<S: Collectable> ResponseCollector<S> {
     ///
     /// TODO would be nice if this could time out; it currently blocks indefinitely.
     pub fn wait_all(&mut self) {
-        while self.counter.load(Ordering::SeqCst) != 0 {
+        while self.counter != 0 {
             let msg = self.rx.recv().unwrap();
-            self.counter.fetch_sub(1, Ordering::SeqCst);
+            self.counter -= 1;
             if let Some(buffered) = msg {
                 self.responses.push(buffered);
             } else {
