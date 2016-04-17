@@ -2,11 +2,9 @@ extern crate hydra;
 extern crate hyper;
 extern crate env_logger;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use hydra::{Method, Request, Hydra};
-use hydra::{connection, protocol};
 use hydra::Headers;
 use hydra::StatusCode;
 

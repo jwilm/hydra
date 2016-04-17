@@ -187,6 +187,40 @@ impl From<io::Error> for ConnectionError {
 
 pub type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;
 
+#[derive(Debug)]
 pub enum RequestError {
-    Variant
+    /// The remote end terminated this stream. No more data will arrive.
+    Reset,
+
+    /// request cannot be completed because the connection entered an error state
+    Connection,
+
+    /// Request cannot be completed because an error was returned from a stream handler method
+    User,
 }
+
+impl ::std::error::Error for RequestError {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        None
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            RequestError::Reset => "stream reset by peer",
+            RequestError::Connection => "connection encountered error",
+            RequestError::User => "error during stream handler call",
+        }
+    }
+}
+
+impl ::std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        try!(write!(f, "Request failed because "));
+        match *self {
+            RequestError::Reset => write!(f, "stream was reset by peer"),
+            RequestError::Connection => write!(f, "connection encountered an error"),
+            RequestError::User => write!(f, "an error was returned from a stream handler call"),
+        }
+    }
+}
+

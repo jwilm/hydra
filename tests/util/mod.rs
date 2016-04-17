@@ -4,16 +4,31 @@ use std::io::Cursor;
 use std::marker::PhantomData;
 use std::sync::mpsc;
 
-use hydra::{self, Method, Request, connection, protocol, Headers};
+use hydra::{self, connection};
 use hydra::StatusCode;
 use hydra::StreamDataState;
-
 
 /// Messages sent by ConnectHandler
 pub enum ConnectionMsg {
     Error(hydra::ConnectionError),
     Connected(connection::Handle),
     Pong
+}
+
+/// Messages sent by a StreamHandler
+#[derive(Debug)]
+pub enum StreamMsg {
+    Error(::hydra::RequestError),
+    Response(BufferedResponse),
+}
+
+impl StreamMsg {
+    pub fn result(self) -> Result<BufferedResponse, ::hydra::RequestError> {
+        match self {
+            StreamMsg::Response(res) => Ok(res),
+            StreamMsg::Error(err) => Err(err),
+        }
+    }
 }
 
 /// Handles connection related events by implementing connection::Handler
@@ -50,13 +65,14 @@ impl connection::Handler for ConnectHandler {
 /// StreamHandler that is needed (one per request). The `wait_all` function is used to block until
 /// all of the streams have been resolved through any means (nominally, error, etc).
 pub struct ResponseCollector<S> {
-    rx: mpsc::Receiver<Option<BufferedResponse>>,
-    tx: mpsc::Sender<Option<BufferedResponse>>,
+    rx: mpsc::Receiver<StreamMsg>,
+    tx: mpsc::Sender<StreamMsg>,
     counter: usize,
-    responses: Vec<BufferedResponse>,
+    messages: Vec<StreamMsg>,
     _marker: PhantomData<S>
 }
 
+#[derive(Debug)]
 pub struct BufferedResponse {
     pub response: hydra::Response,
     pub body: Vec<u8>,
@@ -78,7 +94,7 @@ impl<S> Default for ResponseCollector<S> {
             rx: rx,
             tx: tx,
             counter: 0,
-            responses: Vec::new(),
+            messages: Vec::new(),
             _marker: PhantomData
         }
     }
@@ -92,7 +108,7 @@ impl<S: Collectable> ResponseCollector<S> {
 
     /// Get a stream handler
     ///
-    /// Returns a StreamHandler and increments the number of responses `wait_all` expects
+    /// Returns a StreamHandler and increments the number of messages `wait_all` expects
     pub fn new_stream_handler(&mut self) -> S {
         self.counter += 1;
 
@@ -106,26 +122,25 @@ impl<S: Collectable> ResponseCollector<S> {
         while self.counter != 0 {
             let msg = self.rx.recv().unwrap();
             self.counter -= 1;
-            if let Some(buffered) = msg {
-                self.responses.push(buffered);
-            } else {
-                panic!("unexpected msg");
-            }
+            self.messages.push(msg);
         }
     }
 
-    /// Run a checker against the buffered responses.
+    /// Run a checker against the buffered messages.
     pub fn check_responses<C>(&self, _: C)
         where C: CheckResponse,
     {
-        for response in &self.responses {
-            C::check(response);
+        for msg in &self.messages {
+            match *msg {
+                StreamMsg::Error(ref err) => panic!("got error response: {}", err),
+                StreamMsg::Response(ref res) => C::check(res)
+            }
         }
     }
 }
 
 pub trait Collectable: hydra::StreamHandler {
-    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> Self;
+    fn new(tx: mpsc::Sender<StreamMsg>) -> Self;
 }
 
 /// Implementor of hydra::StreamHandler; receives stream events
@@ -134,14 +149,14 @@ pub trait Collectable: hydra::StreamHandler {
 /// to `new`.
 #[derive(Debug)]
 pub struct HeadersOnlyHandler {
-    tx: mpsc::Sender<Option<BufferedResponse>>,
+    tx: mpsc::Sender<StreamMsg>,
     // outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
     response: Option<hydra::Response>
 }
 
 impl Collectable for HeadersOnlyHandler {
-    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> HeadersOnlyHandler {
+    fn new(tx: mpsc::Sender<StreamMsg>) -> HeadersOnlyHandler {
         HeadersOnlyHandler {
             tx: tx,
             body: Vec::new(),
@@ -151,15 +166,15 @@ impl Collectable for HeadersOnlyHandler {
 }
 
 impl hydra::StreamHandler for HeadersOnlyHandler {
-    fn on_error(&mut self, _err: hydra::RequestError) {
-        self.tx.send(None).unwrap();
+    fn on_error(&mut self, err: hydra::RequestError) {
+        self.tx.send(StreamMsg::Error(err)).unwrap();
     }
 
     fn on_response_data(&mut self, bytes: &[u8]) {
         self.body.extend_from_slice(bytes);
     }
 
-    fn stream_data(&mut self, buf: &mut [u8]) -> StreamDataState {
+    fn stream_data(&mut self, _buf: &mut [u8]) -> StreamDataState {
         unimplemented!();
     }
 
@@ -175,7 +190,7 @@ impl hydra::StreamHandler for HeadersOnlyHandler {
 
         let response = self.response.take().unwrap();
 
-        self.tx.send(Some(BufferedResponse {
+        self.tx.send(StreamMsg::Response(BufferedResponse {
             response: response,
             body: res,
         })).unwrap();
@@ -197,7 +212,7 @@ impl GetBody for HelloWorld {
 
 #[derive(Debug)]
 pub struct BodyWriter<G: GetBody> {
-    tx: mpsc::Sender<Option<BufferedResponse>>,
+    tx: mpsc::Sender<StreamMsg>,
     outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
     response: Option<hydra::Response>,
@@ -207,7 +222,7 @@ pub struct BodyWriter<G: GetBody> {
 impl<G> Collectable for BodyWriter<G>
     where G: GetBody,
 {
-    fn new(tx: mpsc::Sender<Option<BufferedResponse>>) -> BodyWriter<G> {
+    fn new(tx: mpsc::Sender<StreamMsg>) -> BodyWriter<G> {
         BodyWriter {
             tx: tx,
             body: Vec::new(),
@@ -221,8 +236,8 @@ impl<G> Collectable for BodyWriter<G>
 impl<G> hydra::StreamHandler for BodyWriter<G>
     where G: GetBody,
 {
-    fn on_error(&mut self, _err: hydra::RequestError) {
-        self.tx.send(None).unwrap();
+    fn on_error(&mut self, err: hydra::RequestError) {
+        self.tx.send(StreamMsg::Error(err)).unwrap();
     }
 
     fn on_response_data(&mut self, bytes: &[u8]) {
@@ -234,7 +249,7 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
 
         let read = match self.outgoing.read(buf) {
             Ok(count) => count,
-            Err(err) => return StreamDataState::error(),
+            Err(_) => return StreamDataState::error(),
         };
         let pos = self.outgoing.position() as usize;
         let total = self.outgoing.get_ref().len();
@@ -258,7 +273,7 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
 
         let response = self.response.take().unwrap();
 
-        self.tx.send(Some(BufferedResponse {
+        self.tx.send(StreamMsg::Response(BufferedResponse {
             response: response,
             body: res,
         })).unwrap();
@@ -292,6 +307,7 @@ macro_rules! response_spec {
     } => {
         struct $type_name;
 
+        #[allow(unused_variables)]
         impl $crate::util::CheckResponse for $type_name {
             fn check(res: &$crate::util::BufferedResponse) {
                 // Compare the status.
