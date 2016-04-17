@@ -13,8 +13,10 @@ log = "*"
 httparse = "*"
 
 [dependencies.solicit]
-version = "0.4"
-path = "../solicit"
+# version = "0.4"
+# path = "../solicit"
+git = "https://github.com/mlalic/solicit"
+branch = "master"
 
 [features]
 tls = ["openssl"]
