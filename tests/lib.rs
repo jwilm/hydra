@@ -163,6 +163,4 @@ fn error_during_data_stream() {
             _ => panic!("did not expect valid response: {:?}", message),
         }
     }
-
-    ::std::thread::sleep(::std::time::Duration::from_secs(1));
 }
