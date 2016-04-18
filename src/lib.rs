@@ -39,6 +39,7 @@ pub use protocol::Response;
 pub use protocol::StreamDataState;
 
 pub use connection::Handler as ConnectionHandler;
+pub use ::solicit::http::ErrorCode as Http2ErrorCode;
 
 pub trait Connector: Send + 'static {}
 
@@ -172,6 +173,10 @@ pub enum ConnectionError {
     /// IO layer encountered an error.
     Io(io::Error),
 
+    /// Error from the HTTP/2 state machine; the connection cannot be used for sending further
+    /// requests.
+    Http(::solicit::http::HttpError),
+
     /// Timeout while connecting
     Timeout,
 
@@ -179,9 +184,45 @@ pub enum ConnectionError {
     WorkerClosing,
 }
 
+impl ::std::error::Error for ConnectionError {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            ConnectionError::Io(ref err) => Some(err),
+            ConnectionError::Http(ref err) => Some(err),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            ConnectionError::Io(ref err) => err.description(),
+            ConnectionError::Http(ref err) => err.description(),
+            ConnectionError::Timeout => "timeout when attempting to connect",
+            ConnectionError::WorkerClosing => "worker isn't accepting new connections",
+        }
+    }
+}
+
+impl ::std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            ConnectionError::Io(ref err) => write!(f, "I/O error on connection: {}", err),
+            ConnectionError::Http(ref err) => write!(f, "HTTP/2 error on connection: {}", err),
+            ConnectionError::Timeout => write!(f, "Timeout during connect"),
+            ConnectionError::WorkerClosing => write!(f, "Worker not accepting new connections"),
+        }
+    }
+}
+
 impl From<io::Error> for ConnectionError {
     fn from(err: io::Error) -> ConnectionError {
         ConnectionError::Io(err)
+    }
+}
+
+impl From<::solicit::http::HttpError> for ConnectionError {
+    fn from(val: ::solicit::http::HttpError) -> ConnectionError {
+        ConnectionError::Http(val)
     }
 }
 
@@ -197,6 +238,14 @@ pub enum RequestError {
 
     /// Request cannot be completed because an error was returned from a stream handler method
     User,
+
+    /// Received a GOAWAY frame on the connection where this request was being processed. This
+    /// stream was not handled by the server.
+    GoAwayUnprocessed(Http2ErrorCode),
+
+    /// Received a GOAWAY frame on the connection handling this request; this stream was potentially
+    /// processed by the server.
+    GoAwayMaybeProcessed(Http2ErrorCode),
 }
 
 impl ::std::error::Error for RequestError {
@@ -209,6 +258,10 @@ impl ::std::error::Error for RequestError {
             RequestError::Reset => "stream reset by peer",
             RequestError::Connection => "connection encountered error",
             RequestError::User => "error during stream handler call",
+            RequestError::GoAwayUnprocessed(_) => "GOAWAY frame received; stream not processed",
+            RequestError::GoAwayMaybeProcessed(_) => {
+                "GOAWAY frame received; stream maybe processed"
+            },
         }
     }
 }
@@ -220,6 +273,12 @@ impl ::std::fmt::Display for RequestError {
             RequestError::Reset => write!(f, "stream was reset by peer"),
             RequestError::Connection => write!(f, "connection encountered an error"),
             RequestError::User => write!(f, "an error was returned from a stream handler call"),
+            RequestError::GoAwayUnprocessed(code) => {
+                write!(f, "Received a GOAWAY, stream unprocessed; code: {:?}", code)
+            },
+            RequestError::GoAwayMaybeProcessed(code) => {
+                write!(f, "Received a GOAWAY, stream maybe processed; code: {:?}", code)
+            },
         }
     }
 }

@@ -1,5 +1,5 @@
 //! Interactions with the I/O layer and the HTTP/2 state machine
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::fmt;
 
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
@@ -7,7 +7,7 @@ use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 use worker::{self, Worker};
 use protocol::{self, Settings, Protocol, Http2};
 use super::ConnectionError;
-
+use super::ConnectionResult;
 
 /// Type that receives events for a connection
 pub trait Handler: Send + fmt::Debug + 'static {
@@ -173,18 +173,23 @@ impl Connection {
         self.protocol.initialize(conn_ref);
     }
 
-    pub fn ready(&mut self, event_loop: &mut EventLoop<Worker>, events: EventSet) {
+    pub fn ready(&mut self,
+                 event_loop: &mut EventLoop<Worker>,
+                 events: EventSet) -> ConnectionResult<()>
+    {
         trace!("Connection ready: token={:?}; events={:?}", self.token, events);
         if events.is_readable() {
-            self.read(event_loop);
+            try!(self.read(event_loop));
         }
         if events.is_writable() {
             self.set_writable(true);
             // Whenever the connection becomes writable, we try a write.
-            self.try_write(event_loop).unwrap();
+            try!(self.try_write(event_loop));
         }
 
         self.reregister(event_loop);
+
+        Ok(())
     }
 
     fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) {
@@ -197,7 +202,13 @@ impl Connection {
         event_loop.reregister(self.stream(), self.token, flags, pollopt);
     }
 
+    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> io::Result<()> {
+        event_loop.deregister(self.stream())
+    }
+
     pub fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
+        // The scope is necessary here since otherwise the borrow checker thinks
+        // the event_loop is borrowed too long and we can't call self.reregister.
         {
             let conn_ref = Ref {
                 event_loop: event_loop,
@@ -207,22 +218,25 @@ impl Connection {
                 is_writable: self.is_writable,
             };
 
+            // Notify the protocol
             self.protocol.notify(msg, conn_ref);
         }
+
+        // Reregister this connection on the event loop
         self.reregister(event_loop);
     }
 
-    fn read(&mut self, event_loop: &mut EventLoop<Worker>) {
+    fn read(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
         // TODO Handle the case where the buffer isn't large enough to completely
         // exhaust the socket (since we're edge-triggered, we'd never get another
         // chance to read!)
         trace!("Handling read");
-        match self.stream.try_read_buf(&mut self.read_buf) {
-            Ok(Some(0)) => {
+        match try!(self.stream.try_read_buf(&mut self.read_buf)) {
+            Some(0) => {
                 debug!("EOF");
-                // EOF
+                // TODO EOF; should close connection and any remaining streams
             },
-            Ok(Some(n)) => {
+            Some(n) => {
                 debug!("read {} bytes", n);
                 let consumed = {
                     let conn_ref = Ref {
@@ -233,7 +247,8 @@ impl Connection {
                         handler: &*self.handler,
                     };
                     let buf = &self.read_buf;
-                    self.protocol.on_data(buf, conn_ref).unwrap()
+
+                    try!(self.protocol.on_data(buf, conn_ref))
                 };
 
                 // TODO Would a circular buffer be better than draining here...?
@@ -248,17 +263,15 @@ impl Connection {
 
                 trace!("Done.");
             },
-            Ok(None) => {
+            None => {
                 trace!("read WOULDBLOCK");
             },
-            Err(e) => {
-                // TODO FIXME
-                panic!("got an error trying to read; err={:?}", e);
-            },
-        };
+        }
+
+        Ok(())
     }
 
-    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<(), ()> {
+    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
         trace!("-> Attempting to write!");
         if !self.is_writable {
             trace!("Currently not writable!");
@@ -291,7 +304,7 @@ impl Connection {
         Ok(())
     }
 
-    fn write_backlog(&mut self) -> Result<(), ()> {
+    fn write_backlog(&mut self) -> ConnectionResult<()> {
         loop {
             if self.backlog.is_empty() {
                 trace!("Backlog already empty.");
@@ -300,21 +313,18 @@ impl Connection {
             trace!("Trying a write from the backlog; items in backlog - {}", self.backlog.len());
             let status = {
                 let buf = &mut self.backlog[0];
-                match self.stream.try_write_buf(buf) {
-                    Ok(Some(_)) if buf.get_ref().len() == buf.position() as usize => {
+                match try!(self.stream.try_write_buf(buf)) {
+                    Some(_) if buf.get_ref().len() == buf.position() as usize => {
                         trace!("Full frame written!");
                         WriteStatus::Full
                     },
-                    Ok(Some(sz)) => {
+                    Some(sz) => {
                         trace!("Partial write: {} bytes", sz);
                         WriteStatus::Partial
                     },
-                    Ok(None) => {
+                    None => {
                         trace!("Write WOULDBLOCK");
                         WriteStatus::WouldBlock
-                    },
-                    Err(e) => {
-                        panic!("Error writing! {:?}", e);
                     },
                 }
             };

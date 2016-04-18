@@ -1,69 +1,108 @@
 //! Header types and utilities
-
-#[derive(Debug)]
-pub enum ConversionError {
-    Utf8(::std::str::Utf8Error),
-    HyperFromRaw(::hyper::Error),
-}
-
-impl ::std::error::Error for ConversionError {
-    fn cause(&self) -> Option<&::std::error::Error> {
-        match *self {
-            ConversionError::Utf8(ref err) => Some(err),
-            ConversionError::HyperFromRaw(ref err) => Some(err),
-        }
-    }
-
-    fn description(&self) -> &str {
-        match *self {
-            ConversionError::Utf8(ref err) => err.description(),
-            ConversionError::HyperFromRaw(ref err) => err.description(),
-        }
-    }
-}
-
-impl ::std::fmt::Display for ConversionError {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        match *self {
-            ConversionError::Utf8(ref err) => {
-                write!(f, "Failed parsing header name as utf8: {}", err)
-            },
-            ConversionError::HyperFromRaw(ref err) => {
-                write!(f, "Failed to build hyper headers from raw headers: {}", err)
-            },
-        }
-    }
-}
-
-impl From<::std::str::Utf8Error> for ConversionError {
-    fn from(val: ::std::str::Utf8Error) -> ConversionError {
-        ConversionError::Utf8(val)
-    }
-}
-
-impl From<::hyper::Error> for ConversionError {
-    fn from(val: ::hyper::Error) -> ConversionError {
-        ConversionError::HyperFromRaw(val)
-    }
-}
-
 use std::str;
 use std::ascii::AsciiExt;
 
 use httparse;
 
+use hyper::header::Headers;
+use hyper::status::StatusCode;
+
 use solicit::http::Header;
 
-use hyper::header::Headers;
+/// Error resulting from parsing solicit headers
+#[derive(Debug)]
+pub enum ParseError {
+    Utf8(::std::str::Utf8Error),
+    HyperFromRaw(::hyper::Error),
+    StatusNotNumber(::std::num::ParseIntError),
+    StatusMissing,
+}
+
+impl ::std::error::Error for ParseError {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            ParseError::Utf8(ref err) => Some(err),
+            ParseError::HyperFromRaw(ref err) => Some(err),
+            ParseError::StatusNotNumber(ref err) => Some(err),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            ParseError::Utf8(ref err) => err.description(),
+            ParseError::HyperFromRaw(ref err) => err.description(),
+            ParseError::StatusNotNumber(_) => ":status pseudo header not a number",
+            ParseError::StatusMissing => ":status pseudo header missing",
+        }
+    }
+}
+
+impl ::std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            ParseError::Utf8(ref err) => {
+                write!(f, "Failed parsing header name as utf8: {}", err)
+            },
+            ParseError::HyperFromRaw(ref err) => {
+                write!(f, "Failed to build hyper headers from raw headers: {}", err)
+            },
+            ParseError::StatusNotNumber(ref err) => {
+                write!(f, "Failed to parse :status pseudo header as integer: {}", err)
+            },
+            ParseError::StatusMissing => write!(f, ":status pseudo header was not included"),
+        }
+    }
+}
+
+impl From<::std::str::Utf8Error> for ParseError {
+    fn from(val: ::std::str::Utf8Error) -> ParseError {
+        ParseError::Utf8(val)
+    }
+}
+
+impl From<::hyper::Error> for ParseError {
+    fn from(val: ::hyper::Error) -> ParseError {
+        ParseError::HyperFromRaw(val)
+    }
+}
+
+impl From<::std::num::ParseIntError> for ParseError {
+    fn from(val: ::std::num::ParseIntError) -> ParseError {
+        ParseError::StatusNotNumber(val)
+    }
+}
+
+pub type ParseResult<T> = ::std::result::Result<T, ParseError>;
+
+pub fn to_status_and_headers<'n, 'v>(headers: Vec<Header<'n, 'v>>)
+    -> ParseResult<(StatusCode, Headers)>
+{
+    let headers = try!(to_hyper(headers));
+
+    let status_code = match headers.get_raw(":status") {
+        Some(ref raw_statuses) => {
+            // raw_statuses is a &[Vec<u8>]
+            assert!(raw_statuses.len() > 0);
+            let raw_status_bytes = &raw_statuses[0];
+            let raw_status_str = try!(::std::str::from_utf8(&raw_status_bytes[..]));
+            let raw_status_num = try!(raw_status_str.parse::<u16>());
+            StatusCode::from_u16(raw_status_num)
+        },
+        _ => return Err(ParseError::StatusMissing),
+    };
+
+    Ok((status_code, headers))
+}
 
 /// Parses raw solicit headers into hyper headers
-pub fn to_hyper(headers: Vec<Header>) -> Result<Headers, ConversionError> {
+pub fn to_hyper(headers: Vec<Header>) -> ParseResult<Headers> {
     let httparse_headers = try!(headers.iter().map(|header| {
         Ok(httparse::Header {
             name: try!(str::from_utf8(&header.name())),
             value: &header.value(),
         })
-    }).collect::<Result<Vec<_>, ConversionError>>());
+    }).collect::<Result<Vec<_>, ParseError>>());
 
     // TODO from_raw does a copy of the httparse::Header values. We can provide owned values,
     // so the copies are wasteful.

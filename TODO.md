@@ -3,9 +3,9 @@ TODO
 
 # What I was doing when I stepped away
 
-Just noticed that StreamHandlers in tests are pretty much always the same save
-for the `stream_data` method. Maybe worth writing a macro to define these
-things, too!.
+handle_next_frame for GOAWAY frame currently results in a connection error being
+generated. The error is generated in the session `on_goaway` implementation. We
+need to add our own on_goaway
 
 # MVP TODOs
 
@@ -32,3 +32,4 @@ things, too!.
 
 * Async DNS lookup the proper way
 * Optimize event loop reregistration
+* Remove `expect` calls which can be avoided through refactoring

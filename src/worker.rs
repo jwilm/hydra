@@ -211,7 +211,14 @@ impl mio::Handler for Worker {
              token: Token,
              events: EventSet)
     {
-        self.connections[token].ready(event_loop, events);
+        if let Err(err) = self.connections[token].ready(event_loop, events) {
+            // TODO connection abnormal shutdown
+            // 1. deregister connection (and remove from self.connections)
+            // 2. call connection error handler
+            panic!("unhandled io error: {}", err);
+            let mut connection = self.connections.remove(token).expect("connection in slab");
+            connection.deregister(event_loop);
+        }
     }
 
     fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: Msg) {

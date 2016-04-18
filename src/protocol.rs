@@ -16,6 +16,8 @@ use solicit::http::client::{write_preface, ClientConnection, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
 use solicit::http::session::{self, Stream as SessionStream};
 
+use super::RequestError;
+
 use hyper::header::Headers;
 
 use connection::{self, DispatchConnectionEvent};
@@ -142,7 +144,7 @@ pub trait StreamHandler: Send + fmt::Debug + 'static {
 
 pub trait Protocol: Sized + 'static {
     fn new() -> Self;
-    fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> Result<usize, ()>;
+    fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> HttpResult<usize>;
     fn ready_write(&mut self, conn: connection::Ref);
     fn notify(&mut self, msg: Msg, conn: connection::Ref);
 }
@@ -178,7 +180,7 @@ impl<'a, 'b> SendFrame for SendDirect<'a, 'b> {
 /// consume the RawFrame. Since HttpFrame::from_raw requires an owned RawFrame, it is held in an
 /// option to be moved at some point.
 struct WrappedReceive<'a> {
-    frame: Option<RawFrame<'a>>,
+    frame: RawFrame<'a>,
 }
 
 impl<'a> WrappedReceive<'a> {
@@ -188,19 +190,19 @@ impl<'a> WrappedReceive<'a> {
     /// None.
     fn parse(buf: &'a [u8]) -> Option<WrappedReceive<'a>> {
         RawFrame::parse(buf).map(|frame| WrappedReceive {
-            frame: Some(frame),
+            frame: frame,
         })
     }
 
-    pub fn frame(&self) -> Option<&RawFrame<'a>> {
-        self.frame.as_ref()
+    pub fn frame(&self) -> &RawFrame<'a> {
+        &self.frame
     }
 }
 
 impl<'a> ReceiveFrame for WrappedReceive<'a> {
     /// Take the wrapped frame and parse it
     fn recv_frame(&mut self) -> HttpResult<HttpFrame> {
-        HttpFrame::from_raw(self.frame.as_ref().unwrap())
+        HttpFrame::from_raw(&self.frame)
     }
 }
 
@@ -480,7 +482,7 @@ impl Http2 {
                        buf: &mut [u8]) -> Option<StreamResult> {
         interest.iter()
             .map(|id| {
-                let stream = state.get_stream_mut(*id).expect("interest stream in state");
+                let stream = state.get_stream_mut(*id).expect("interest ∈ state");
                 debug_assert!(!stream.is_closed_local());
                 StreamResult {
                     id: *id,
@@ -493,7 +495,7 @@ impl Http2 {
     pub fn initialize(&mut self, mut conn: connection::Ref) {
         // Write preface
         let mut buf = Vec::new();
-        write_preface(&mut buf).unwrap();
+        write_preface(&mut buf).expect("infallible write to vec");
         conn.queue_frame(buf);
     }
 
@@ -516,8 +518,8 @@ impl Protocol for Http2 {
         }
     }
 
-    fn on_data<'a>(&mut self, buf: &[u8], mut conn: connection::Ref) -> Result<usize, ()> {
-        trace!("Http2: Received something back");
+    fn on_data(&mut self, buf: &[u8], mut conn: connection::Ref) -> HttpResult<usize> {
+        trace!("on_data");
         let mut total_consumed = 0;
         loop {
             match WrappedReceive::parse(&buf[total_consumed..]) {
@@ -532,20 +534,21 @@ impl Protocol for Http2 {
                     break;
                 },
                 Some(mut receiver) => {
-                    let len = receiver.frame().unwrap().len();
+                    let len = receiver.frame().len();
                     debug!("Handling an HTTP/2 frame of total size {}", len);
 
                     if !self.got_settings {
                         {
                             let mut sender = SendDirect { conn: &mut conn };
-                            try!(self.expect_settings(&mut receiver, &mut sender).map_err(|_| ()));
+                            // TODO protocol error if this errors
+                            try!(self.expect_settings(&mut receiver, &mut sender));
                         }
 
                         self.got_settings = true;
                         conn.connection_ready();
                     } else {
                         let mut sender = SendDirect { conn: &mut conn };
-                        try!(self.handle_next_frame(&mut receiver, &mut sender).map_err(|_| ()));
+                        try!(self.handle_next_frame(&mut receiver, &mut sender));
                     }
 
                     total_consumed += len;
@@ -657,32 +660,26 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
     fn new_headers<'n, 'v>(&mut self,
                            stream_id: StreamId,
                            headers: Vec<Header<'n, 'v>>,
-                           _conn: &mut HttpConnection) -> HttpResult<()>
+                           conn: &mut HttpConnection) -> HttpResult<()>
     {
         debug!("Headers for stream {}", stream_id);
+        let (status_code, headers) = match header::to_status_and_headers(headers) {
+            Ok(vals) => vals,
+            Err(err) => {
+                // Headers not provided according to HTTP protocol; reset the stream.
+                try!(self.rst_stream(stream_id, ErrorCode::ProtocolError, conn));
+                return Ok(());
+            },
+        };
+
+        // Handle stream not being available
         if let Some(mut stream) = self.state.get_stream_mut(stream_id) {
-            // Now let the stream handle the headers
-            let mut headers = header::to_hyper(headers).unwrap();
-            let status_code = match headers.get_raw(":status") {
-                Some(ref raw_statuses) => {
-                    // raw_statuses is a &[Vec<u8>]
-                    assert!(raw_statuses.len() > 0);
-                    let raw_status_bytes = &raw_statuses[0];
-                    let raw_status_str = ::std::str::from_utf8(&raw_status_bytes[..]).unwrap();
-                    let raw_status_num = raw_status_str.parse::<u16>().unwrap();
-                    StatusCode::from_u16(raw_status_num)
-                },
-                _ => unimplemented!()
-            };
-
-            // :status is a pseudo header that shouldn't be available in the application
-            headers.remove_raw(":status");
-
             stream.on_response(Response {
                 headers: headers,
                 status: status_code,
             });
         }
+
         Ok(())
     }
 
@@ -736,5 +733,40 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
         // TODO need to call the connection handler on_pong function
         debug!("Received a PING ack");
         Ok(())
+    }
+
+    /// Handle a GOAWAY frame sent from the server
+    ///
+    /// The `last_stream_id` indicates the last stream which the client initiated that has been or
+    /// may yet be processed by the server. Streams with an ID greater than this will immedately be
+    /// removed from the state object and have their on_error handler called with a
+    /// RequestError::GoAwayUnprocessed(code). Streams with an ID less than the `last_stream_id`
+    /// will have their on_error handler called with RequestError::GoAwayMaybeProcessed(code).
+    /// Finally, an HttpError is returned from this handler which should bubble up all the way to
+    /// the connection level.
+    fn on_goaway(&mut self,
+                 last_stream_id: StreamId,
+                 error_code: ErrorCode,
+                 debug_data: Option<&[u8]>,
+                 conn: &mut HttpConnection) -> HttpResult<()>
+    {
+        use ::solicit::http::ConnectionError;
+
+        for (id, stream) in self.state.iter() {
+            if *id > last_stream_id {
+                // Definitely unprocessed
+                stream.on_error(RequestError::GoAwayUnprocessed(error_code));
+            } else {
+                // Maybe processed
+                stream.on_error(RequestError::GoAwayMaybeProcessed(error_code));
+            }
+        }
+
+        let err = match debug_data {
+            Some(data) => ConnectionError::with_debug_data(error_code, data.to_vec()),
+            None => ConnectionError::new(error_code),
+        };
+
+        Err(HttpError::PeerConnectionError(err))
     }
 }
