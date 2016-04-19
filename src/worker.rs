@@ -54,46 +54,6 @@ impl From<mio::NotifyError<Msg>> for WorkerError {
 
 pub type WorkerResult<T> = ::std::result::Result<T, WorkerError>;
 
-// #[derive(Debug)]
-// pub enum InternalError {
-//     FullSlab,
-//     Io(io::Error),
-// }
-// 
-// impl ::std::error::Error for InternalError {
-//     fn cause(&self) -> Option<&::std::error::Error> {
-//         match *self {
-//             InternalError::FullSlab => None,
-//             InternalError::Io(ref err) => Some(err),
-//         }
-//     }
-// 
-//     fn description(&self) -> &str {
-//         match *self {
-//             InternalError::FullSlab => "cannot establish connection; worker at capacity",
-//             InternalError::Io(ref err) => "Worker encountered I/O error",
-//         }
-//     }
-// }
-// 
-// impl ::std::fmt::Display for InternalError {
-//     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-//         match *self {
-//             InternalError::FullSlab => write!(f, "The worker has reached maximum connectedness"),
-//             InternalError::Io(ref err) => write!(f, "Worker encountered I/O error: {}", err),
-//         }
-//     }
-// }
-// 
-// impl From<io::Error> for InternalError {
-//     fn from(val: io::Error) -> InternalError {
-//         InternalError::Io(val)
-//     }
-// }
-// 
-// pub type InternalResult<T> = ::std::result::Result<T, InternalError>;
-
-
 /// Messages sent to the worker
 #[derive(Debug)]
 pub enum Msg {

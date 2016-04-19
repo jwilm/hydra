@@ -44,9 +44,6 @@ pub trait Connector: Send + 'static {}
 
 use util::each_addr;
 
-// pub struct TlsConnector;
-// impl Connector for TlsConnector {}
-
 pub struct PlaintextConnector;
 impl Connector for PlaintextConnector {}
 

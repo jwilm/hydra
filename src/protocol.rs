@@ -23,12 +23,6 @@ use header;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
-/// Extensions to solicit's session::SessionState trait
-// TODO get the writing working with the current trait, then update to use this instead.
-// trait StreamExt {
-    // fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
-// }
-
 
 /// Upon successfully reading from a stream, ReadInfo is provided in the StreamDataState
 #[derive(Debug, Eq, PartialEq)]
