@@ -66,7 +66,7 @@ impl Default for Config {
 #[derive(Debug)]
 pub enum HydraError {
     Io(io::Error),
-    Worker(worker::WorkerError),
+    Worker(worker::Error),
 }
 
 impl ::std::error::Error for HydraError {
@@ -94,8 +94,8 @@ impl ::std::fmt::Display for HydraError {
     }
 }
 
-impl From<worker::WorkerError> for HydraError {
-    fn from(val: worker::WorkerError) -> HydraError {
+impl From<worker::Error> for HydraError {
+    fn from(val: worker::Error) -> HydraError {
         HydraError::Worker(val)
     }
 }
@@ -209,70 +209,6 @@ impl Request {
     }
 }
 
-#[derive(Debug)]
-pub enum ConnectionError {
-    /// IO layer encountered an error.
-    Io(io::Error),
-
-    /// Error from the HTTP/2 state machine; the connection cannot be used for sending further
-    /// requests.
-    Http(::solicit::http::HttpError),
-
-    /// Timeout while connecting
-    Timeout,
-
-    /// The worker is closing and a connection can not be created.
-    WorkerClosing,
-
-    /// The worker has reached its capacity for connections
-    WorkerFull,
-}
-
-impl ::std::error::Error for ConnectionError {
-    fn cause(&self) -> Option<&::std::error::Error> {
-        match *self {
-            ConnectionError::Io(ref err) => Some(err),
-            ConnectionError::Http(ref err) => Some(err),
-            _ => None,
-        }
-    }
-
-    fn description(&self) -> &str {
-        match *self {
-            ConnectionError::Io(ref err) => err.description(),
-            ConnectionError::Http(ref err) => err.description(),
-            ConnectionError::Timeout => "timeout when attempting to connect",
-            ConnectionError::WorkerClosing => "worker isn't accepting new connections",
-            ConnectionError::WorkerFull => "worker cannot manage more connections",
-        }
-    }
-}
-
-impl ::std::fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        match *self {
-            ConnectionError::Io(ref err) => write!(f, "I/O error on connection: {}", err),
-            ConnectionError::Http(ref err) => write!(f, "HTTP/2 error on connection: {}", err),
-            ConnectionError::Timeout => write!(f, "Timeout during connect"),
-            ConnectionError::WorkerClosing => write!(f, "Worker not accepting new connections"),
-            ConnectionError::WorkerFull => write!(f, "Worker at connection capacity"),
-        }
-    }
-}
-
-impl From<io::Error> for ConnectionError {
-    fn from(err: io::Error) -> ConnectionError {
-        ConnectionError::Io(err)
-    }
-}
-
-impl From<::solicit::http::HttpError> for ConnectionError {
-    fn from(val: ::solicit::http::HttpError) -> ConnectionError {
-        ConnectionError::Http(val)
-    }
-}
-
-pub type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;
 
 #[derive(Debug)]
 pub enum RequestError {

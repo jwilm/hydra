@@ -10,7 +10,7 @@ use hydra::StreamDataState;
 
 /// Messages sent by ConnectHandler
 pub enum ConnectionMsg {
-    Error(hydra::ConnectionError),
+    Error(connection::Error),
     Connected(connection::Handle),
     Pong
 }
@@ -41,7 +41,7 @@ impl connection::Handler for ConnectHandler {
         self.tx.send(ConnectionMsg::Connected(connection)).unwrap();
     }
 
-    fn on_error(&self, err: hydra::ConnectionError) {
+    fn on_error(&self, err: connection::Error) {
         self.tx.send(ConnectionMsg::Error(err)).unwrap();
     }
 

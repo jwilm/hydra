@@ -14,45 +14,44 @@ use protocol::{self, Protocol};
 use connection::{self, Connection};
 use util::thread;
 
-use super::ConnectionError;
-
 /// Errors that may occur when interacting with a worker
 #[derive(Debug)]
-pub enum WorkerError {
+pub enum Error {
     Unavailable(mio::NotifyError<Msg>),
 }
 
-impl ::std::error::Error for WorkerError {
+impl ::std::error::Error for Error {
     fn cause(&self) -> Option<&::std::error::Error> {
         match *self {
-            WorkerError::Unavailable(ref err) => Some(err),
+            Error::Unavailable(ref err) => Some(err),
         }
     }
 
     fn description(&self) -> &str {
         match *self {
-            WorkerError::Unavailable(_) => "worker is unavailable",
+            Error::Unavailable(_) => "worker is unavailable",
         }
     }
 }
 
-impl ::std::fmt::Display for WorkerError {
+impl ::std::fmt::Display for Error {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         match *self {
-            WorkerError::Unavailable(ref err) => {
+            Error::Unavailable(ref err) => {
                 write!(f, "worker is unavailable; failed to notify: {}", err)
             },
         }
     }
 }
 
-impl From<mio::NotifyError<Msg>> for WorkerError {
-    fn from(val: mio::NotifyError<Msg>) -> WorkerError {
-        WorkerError::Unavailable(val)
+impl From<mio::NotifyError<Msg>> for Error {
+    fn from(val: mio::NotifyError<Msg>) -> Error {
+        Error::Unavailable(val)
     }
 }
 
-pub type WorkerResult<T> = ::std::result::Result<T, WorkerError>;
+/// worker result type
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 /// Messages sent to the worker
 #[derive(Debug)]
@@ -126,7 +125,7 @@ impl Handle {
     /// Worker should create a new connection with the given TcpStream
     pub fn connect(&self,
                    stream: TcpStream,
-                   handler: Box<connection::Handler>) -> WorkerResult<()>
+                   handler: Box<connection::Handler>) -> Result<()>
     {
         Ok(try!(self.tx.send(Msg::CreatePlaintextConnection(stream, handler))))
     }
@@ -140,7 +139,7 @@ impl Worker {
     /// Create a new worker
     ///
     /// Spawns a new thread with a worker using config. A `Handle` for the Worker thread is retured.
-    pub fn spawn(config: &::Config) -> WorkerResult<Handle> {
+    pub fn spawn(config: &::Config) -> Result<Handle> {
         trace!("spawning a hydra worker");
 
         let mut worker = Worker {
@@ -174,7 +173,7 @@ impl Worker {
     {
         // first check that there is room in the slab such that `insert_with` will succeed.
         if !self.connections.has_remaining() {
-            handler.on_error(ConnectionError::WorkerFull);
+            handler.on_error(connection::Error::WorkerFull);
             return
         }
 
@@ -231,7 +230,7 @@ impl Worker {
     pub fn connection_error(&mut self,
                             event_loop: &mut EventLoop<Worker>,
                             token: Token,
-                            err: ConnectionError)
+                            err: connection::Error)
     {
         let mut connection = self.connections.remove(token).expect("connection in slab");
 
@@ -268,7 +267,7 @@ impl mio::Handler for Worker {
         match msg {
             Msg::CreatePlaintextConnection(stream, handler) => {
                 if self.closing {
-                    handler.on_error(ConnectionError::WorkerClosing);
+                    handler.on_error(connection::Error::WorkerClosing);
                 } else {
                     self.add_connection(event_loop, stream, handler);
                 }

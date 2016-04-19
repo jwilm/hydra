@@ -1,20 +1,87 @@
 //! Interactions with the I/O layer and the HTTP/2 state machine
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::fmt;
 
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 
 use worker::{self, Worker};
 use protocol::{self, Protocol, Http2};
-use super::ConnectionError;
-use super::ConnectionResult;
 
 /// Type that receives events for a connection
 pub trait Handler: Send + fmt::Debug + 'static {
     fn on_connection(&self, Handle);
-    fn on_error(&self, ConnectionError);
+    fn on_error(&self, Error);
     fn on_pong(&self);
 }
+
+/// Errors occurring in or when interacting with a connection
+///
+/// TODO separate internal errors
+#[derive(Debug)]
+pub enum Error {
+    /// IO layer encountered an error.
+    Io(io::Error),
+
+    /// Error from the HTTP/2 state machine; the connection cannot be used for sending further
+    /// requests.
+    Http(::solicit::http::HttpError),
+
+    /// Timeout while connecting
+    Timeout,
+
+    /// The worker is closing and a connection can not be created.
+    WorkerClosing,
+
+    /// The worker has reached its capacity for connections
+    WorkerFull,
+}
+
+impl ::std::error::Error for Error {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            Error::Io(ref err) => Some(err),
+            Error::Http(ref err) => Some(err),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            Error::Io(ref err) => err.description(),
+            Error::Http(ref err) => err.description(),
+            Error::Timeout => "timeout when attempting to connect",
+            Error::WorkerClosing => "worker isn't accepting new connections",
+            Error::WorkerFull => "worker cannot manage more connections",
+        }
+    }
+}
+
+impl ::std::fmt::Display for Error {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            Error::Io(ref err) => write!(f, "I/O error on connection: {}", err),
+            Error::Http(ref err) => write!(f, "HTTP/2 error on connection: {}", err),
+            Error::Timeout => write!(f, "Timeout during connect"),
+            Error::WorkerClosing => write!(f, "Worker not accepting new connections"),
+            Error::WorkerFull => write!(f, "Worker at connection capacity"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error::Io(err)
+    }
+}
+
+impl From<::solicit::http::HttpError> for Error {
+    fn from(val: ::solicit::http::HttpError) -> Error {
+        Error::Http(val)
+    }
+}
+
+/// Connection result type
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 /// An HTTP/2 connection
 ///
@@ -145,10 +212,10 @@ impl<'a> DispatchConnectionEvent for Ref<'a> {
 
 impl Connection {
     pub fn on_connect_timeout(&self) {
-        self.on_error(ConnectionError::Timeout);
+        self.on_error(Error::Timeout);
     }
 
-    pub fn on_error(&self, err: ConnectionError) {
+    pub fn on_error(&self, err: Error) {
         self.handler.on_error(err);
     }
 
@@ -184,7 +251,7 @@ impl Connection {
 
     pub fn ready(&mut self,
                  event_loop: &mut EventLoop<Worker>,
-                 events: EventSet) -> ConnectionResult<()>
+                 events: EventSet) -> Result<()>
     {
         trace!("Connection ready: token={:?}; events={:?}", self.token, events);
         if events.is_readable() {
@@ -203,7 +270,7 @@ impl Connection {
         Ok(())
     }
 
-    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
+    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         let mut flags = mio::EventSet::readable();
         if !self.backlog.is_empty() || self.protocol.wants_write() {
             flags = flags | mio::EventSet::writable();
@@ -213,13 +280,13 @@ impl Connection {
         Ok(try!(event_loop.reregister(self.stream(), self.token, flags, pollopt)))
     }
 
-    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
+    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         Ok(try!(event_loop.deregister(self.stream())))
     }
 
     pub fn notify(&mut self,
                   event_loop: &mut EventLoop<Worker>,
-                  msg: protocol::Msg) -> ConnectionResult<()>
+                  msg: protocol::Msg) -> Result<()>
     {
         // The scope is necessary here since otherwise the borrow checker thinks
         // the event_loop is borrowed too long and we can't call self.reregister.
@@ -241,7 +308,7 @@ impl Connection {
         Ok(())
     }
 
-    fn read(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
+    fn read(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         // TODO Handle the case where the buffer isn't large enough to completely
         // exhaust the socket (since we're edge-triggered, we'd never get another
         // chance to read!)
@@ -285,7 +352,7 @@ impl Connection {
         Ok(())
     }
 
-    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
+    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         trace!("-> Attempting to write!");
         if !self.is_writable {
             trace!("Currently not writable!");
@@ -317,7 +384,7 @@ impl Connection {
         Ok(())
     }
 
-    fn write_backlog(&mut self) -> ConnectionResult<()> {
+    fn write_backlog(&mut self) -> Result<()> {
         loop {
             if self.backlog.is_empty() {
                 trace!("Backlog already empty.");
