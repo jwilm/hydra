@@ -4,7 +4,7 @@ use std::ascii::AsciiExt;
 
 use httparse;
 
-use hyper::header::Headers;
+pub use hyper::header::Headers;
 use hyper::status::StatusCode;
 
 use solicit::http::Header;

@@ -4,9 +4,7 @@ extern crate env_logger;
 
 use std::sync::mpsc;
 
-use hydra::{Method, Request, Hydra};
-use hydra::Headers;
-use hydra::StatusCode;
+use hydra::prelude::*;
 
 #[macro_use]
 mod util;
@@ -156,7 +154,7 @@ fn error_during_data_stream() {
         match message {
             &StreamMsg::Error(ref err) => {
                 match *err {
-                    hydra::RequestError::User => (),
+                    request::Error::User => (),
                     _ => panic!("unexpected stream error: {:?}", err),
                 }
             },

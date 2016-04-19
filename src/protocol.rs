@@ -1,4 +1,3 @@
-use std::fmt;
 use std::collections::HashSet;
 use std::io::Cursor;
 
@@ -13,13 +12,10 @@ use solicit::http::client::{write_preface, RequestStream};
 use solicit::http::session::{DefaultSessionState, SessionState, StreamState};
 use solicit::http::session::{self, Stream as SessionStream};
 
-use super::RequestError;
-
-use hyper::header::Headers;
-
 use connection::{self, DispatchConnectionEvent};
 
 use header;
+use request;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
@@ -72,12 +68,6 @@ struct StreamResult {
     state: StreamDataState,
 }
 
-#[derive(Debug)]
-pub struct Response {
-    pub status: ::hyper::status::StatusCode,
-    pub headers: Headers,
-}
-
 /// Prioritizer where the buffer is already provided and filled; it just needs to be returned from
 /// the data chunk.
 pub struct BufferPrioritizer<'a> {
@@ -109,29 +99,6 @@ impl<'a> DataPrioritizer for BufferPrioritizer<'a> {
     }
 }
 
-/// Stream events and Request/Response bytes are delivered to/from the handler.
-///
-/// Functions of the StreamHandler are called on the event loop's thread. Any work done here should
-/// be as short as possible to not delay network I/O and processing of other streams.
-pub trait StreamHandler: Send + fmt::Debug + 'static {
-    /// Provide data from the request body
-    ///
-    /// This will be called repeatedly until one of StreamDataState::{Last, Error} are returned
-    fn stream_data(&mut self, &mut [u8]) -> StreamDataState;
-
-    /// Response headers are available
-    fn on_response(&mut self, res: Response);
-
-    /// Data from the response is available
-    fn on_response_data(&mut self, data: &[u8]);
-
-    /// Called when the stream is closed (complete)
-    fn on_close(&mut self);
-
-    /// Error occurred
-    fn on_error(&mut self, err: super::RequestError);
-}
-
 pub trait Protocol: Sized + 'static {
     fn new() -> Self;
     fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> HttpResult<usize>;
@@ -143,7 +110,7 @@ pub trait Protocol: Sized + 'static {
 #[derive(Debug)]
 pub enum Msg {
     /// Create a new stream on the current connection
-    CreateStream(::Request, Box<StreamHandler>),
+    CreateStream(request::Request, Box<request::Handler>),
 
     /// Send a PING to the other end of connection
     Ping,
@@ -198,12 +165,12 @@ impl<'a> ReceiveFrame for WrappedReceive<'a> {
 
 pub struct Stream {
     state: session::StreamState,
-    inner: Box<StreamHandler>,
+    inner: Box<request::Handler>,
 }
 
 impl Stream {
     #[inline]
-    pub fn new(handler: Box<StreamHandler>) -> Stream {
+    pub fn new(handler: Box<request::Handler>) -> Stream {
         Stream {
             // TODO should really start in Idle state
             state: session::StreamState::Open,
@@ -212,7 +179,7 @@ impl Stream {
     }
 
     #[inline]
-    pub fn on_response(&mut self, res: Response) {
+    pub fn on_response(&mut self, res: request::Response) {
         self.inner.on_response(res);
     }
 
@@ -220,7 +187,7 @@ impl Stream {
         self.inner.stream_data(buf)
     }
 
-    fn on_error(&mut self, err: super::RequestError) {
+    fn on_error(&mut self, err: request::Error) {
         self.inner.on_error(err)
     }
 }
@@ -300,11 +267,11 @@ impl Http2 {
     ///
     /// This is a convenience method for generating a RequestStream. It is not added to the
     /// protocol's active streams; that is up to the caller.
-    fn new_stream(request: ::Request,
-                  handler: Box<StreamHandler>,
+    fn new_stream(request: request::Request,
+                  handler: Box<request::Handler>,
                   scheme: HttpScheme) -> RequestStream<Stream>
     {
-        let ::Request { method, path, headers_only, mut headers } = request;
+        let request::Request { method, path, headers_only, mut headers } = request;
 
         trace!("new_stream: scheme={:?}, method={}", scheme, method);
 
@@ -461,7 +428,7 @@ impl Http2 {
         if let Some(mut stream) = self.state.remove_stream(id) {
             // Run the on_error callback saying that is closed due to error returnd from the
             // handler.
-            stream.on_error(super::RequestError::User);
+            stream.on_error(request::Error::User);
         }
 
         Ok(())
@@ -569,10 +536,6 @@ impl Protocol for Http2 {
     }
 }
 
-pub trait RequestDelegate: session::Stream {
-    fn started(&mut self, stream_id: StreamId);
-}
-
 /// An implementation of the `Session` trait which wraps the Http2 protocol object
 ///
 /// While handling the events signaled by the `HttpConnection`, the struct will modify the given
@@ -656,7 +619,7 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
 
         // Handle stream not being available
         if let Some(mut stream) = self.state.get_stream_mut(stream_id) {
-            stream.on_response(Response {
+            stream.on_response(request::Response {
                 headers: headers,
                 status: status_code,
             });
@@ -722,8 +685,8 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
     /// The `last_stream_id` indicates the last stream which the client initiated that has been or
     /// may yet be processed by the server. Streams with an ID greater than this will immedately be
     /// removed from the state object and have their on_error handler called with a
-    /// RequestError::GoAwayUnprocessed(code). Streams with an ID less than the `last_stream_id`
-    /// will have their on_error handler called with RequestError::GoAwayMaybeProcessed(code).
+    /// request::Error::GoAwayUnprocessed(code). Streams with an ID less than the `last_stream_id`
+    /// will have their on_error handler called with request::Error::GoAwayMaybeProcessed(code).
     /// Finally, an HttpError is returned from this handler which should bubble up all the way to
     /// the connection level.
     fn on_goaway(&mut self,
@@ -737,10 +700,10 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
         for (id, stream) in self.state.iter() {
             if *id > last_stream_id {
                 // Definitely unprocessed
-                stream.on_error(RequestError::GoAwayUnprocessed(error_code));
+                stream.on_error(request::Error::GoAwayUnprocessed(error_code));
             } else {
                 // Maybe processed
-                stream.on_error(RequestError::GoAwayMaybeProcessed(error_code));
+                stream.on_error(request::Error::GoAwayMaybeProcessed(error_code));
             }
         }
 

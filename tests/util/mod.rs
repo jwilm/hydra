@@ -4,9 +4,7 @@ use std::io::Cursor;
 use std::marker::PhantomData;
 use std::sync::mpsc;
 
-use hydra::{self, connection};
-use hydra::StatusCode;
-use hydra::StreamDataState;
+use hydra::prelude::*;
 
 /// Messages sent by ConnectHandler
 pub enum ConnectionMsg {
@@ -18,7 +16,7 @@ pub enum ConnectionMsg {
 /// Messages sent by a StreamHandler
 #[derive(Debug)]
 pub enum StreamMsg {
-    Error(::hydra::RequestError),
+    Error(request::Error),
     Response(BufferedResponse),
 }
 
@@ -64,7 +62,7 @@ pub struct ResponseCollector<S> {
 }
 
 pub struct BufferedResponse {
-    pub response: hydra::Response,
+    pub response: Response,
     pub body: Vec<u8>,
 }
 
@@ -144,16 +142,16 @@ impl<S: Collectable> ResponseCollector<S> {
     }
 }
 
-pub trait Collectable: hydra::StreamHandler {
+pub trait Collectable: request::Handler {
     fn new(tx: mpsc::Sender<StreamMsg>) -> Self;
 }
 
-/// Implementor of hydra::StreamHandler; returns an error in `stream_data`.
+/// Implementor of request::Handler returns an error in `stream_data`.
 #[derive(Debug)]
 pub struct HandlerStreamError {
     tx: mpsc::Sender<StreamMsg>,
     body: Vec<u8>,
-    response: Option<hydra::Response>,
+    response: Option<Response>,
     generated_error: bool,
 }
 
@@ -168,8 +166,8 @@ impl Collectable for HandlerStreamError {
     }
 }
 
-impl hydra::StreamHandler for HandlerStreamError {
-    fn on_error(&mut self, err: hydra::RequestError) {
+impl request::Handler for HandlerStreamError {
+    fn on_error(&mut self, err: request::Error) {
         self.tx.send(StreamMsg::Error(err)).unwrap();
     }
 
@@ -184,7 +182,7 @@ impl hydra::StreamHandler for HandlerStreamError {
     }
 
     /// Response headers are available
-    fn on_response(&mut self, _res: hydra::Response) {
+    fn on_response(&mut self, _res: Response) {
         unreachable!();
     }
 
@@ -194,7 +192,7 @@ impl hydra::StreamHandler for HandlerStreamError {
     }
 }
 
-/// Implementor of hydra::StreamHandler; receives stream events
+/// Implementor of request::Handler receives stream events
 ///
 /// When an error occurs or the stream terminates normally, an event is sent on the channel passed
 /// to `new`.
@@ -202,7 +200,7 @@ impl hydra::StreamHandler for HandlerStreamError {
 pub struct HeadersOnlyHandler {
     tx: mpsc::Sender<StreamMsg>,
     body: Vec<u8>,
-    response: Option<hydra::Response>
+    response: Option<Response>
 }
 
 impl Collectable for HeadersOnlyHandler {
@@ -215,8 +213,8 @@ impl Collectable for HeadersOnlyHandler {
     }
 }
 
-impl hydra::StreamHandler for HeadersOnlyHandler {
-    fn on_error(&mut self, err: hydra::RequestError) {
+impl request::Handler for HeadersOnlyHandler {
+    fn on_error(&mut self, err: request::Error) {
         self.tx.send(StreamMsg::Error(err)).unwrap();
     }
 
@@ -229,7 +227,7 @@ impl hydra::StreamHandler for HeadersOnlyHandler {
     }
 
     /// Response headers are available
-    fn on_response(&mut self, res: hydra::Response) {
+    fn on_response(&mut self, res: Response) {
         self.response = Some(res);
     }
 
@@ -265,7 +263,7 @@ pub struct BodyWriter<G: GetBody> {
     tx: mpsc::Sender<StreamMsg>,
     outgoing: Cursor<Vec<u8>>,
     body: Vec<u8>,
-    response: Option<hydra::Response>,
+    response: Option<Response>,
     _marker: PhantomData<G>,
 }
 
@@ -283,10 +281,10 @@ impl<G> Collectable for BodyWriter<G>
     }
 }
 
-impl<G> hydra::StreamHandler for BodyWriter<G>
+impl<G> request::Handler for BodyWriter<G>
     where G: GetBody,
 {
-    fn on_error(&mut self, err: hydra::RequestError) {
+    fn on_error(&mut self, err: request::Error) {
         self.tx.send(StreamMsg::Error(err)).unwrap();
     }
 
@@ -312,7 +310,7 @@ impl<G> hydra::StreamHandler for BodyWriter<G>
     }
 
     /// Response headers are available
-    fn on_response(&mut self, res: hydra::Response) {
+    fn on_response(&mut self, res: Response) {
         self.response = Some(res);
     }
 
@@ -395,7 +393,7 @@ fn response_spec_test_response() -> BufferedResponse {
 
     BufferedResponse {
         body: "Hello, world!".as_bytes().to_vec(),
-        response: hydra::Response {
+        response: Response {
             status: StatusCode::Ok,
             headers: headers,
         },

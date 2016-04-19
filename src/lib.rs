@@ -19,37 +19,55 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::net::ToSocketAddrs;
 use std::io;
 
+pub use ::solicit::http::ErrorCode as Http2ErrorCode;
+
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
 pub use hyper::status::{StatusCode, StatusClass};
-pub use hyper::header::{Headers};
 
 pub mod worker;
 pub mod util;
 pub mod protocol;
 pub mod connection;
+pub mod request;
 
 mod header;
 
 use worker::Worker;
+use util::each_addr;
 
-pub use protocol::StreamHandler;
-pub use protocol::Response;
 pub use protocol::StreamDataState;
 
 pub use connection::Handler as ConnectionHandler;
-pub use ::solicit::http::ErrorCode as Http2ErrorCode;
 
 pub trait Connector: Send + 'static {}
 
-use util::each_addr;
+pub mod prelude {
+    pub use Hydra;
+    pub use Method;
+    pub use StatusCode;
+    pub use StreamDataState;
+    pub use connection;
+    pub use header::Headers;
+    pub use request::Request;
+    pub use request::Response;
+    pub use request;
+}
+
 
 pub struct PlaintextConnector;
 impl Connector for PlaintextConnector {}
 
+/// Configuration for Hydra instance
 pub struct Config {
+    /// Timeout in milliseconds for connect calls. Connect error handler will be called with the
+    /// Timeout error if a timeout occurs.
     pub connect_timeout_ms: u64,
+
+    /// Number of connections per worker
     pub conns_per_thread: usize,
+
+    /// Number of worker to spawn
     pub threads: u8,
 }
 
@@ -171,97 +189,9 @@ pub struct Client<'a> {
 }
 
 impl<'a> Client<'a> {
-    pub fn request<H>(&self, _req: Request, handler: H) {
+    pub fn request<H>(&self, _req: request::Request, handler: H) {
         let _handler = Box::new(handler);
         unimplemented!();
-    }
-}
-
-#[derive(Debug)]
-pub struct Request {
-    method: Method,
-    headers: Headers,
-    path: String,
-    headers_only: bool,
-}
-
-impl Request {
-    pub fn new<P>(method: Method, path: P, headers: Headers) -> Request
-        where P: Into<String>,
-    {
-        Request {
-            method: method,
-            path: path.into(),
-            headers_only: false,
-            headers: headers,
-        }
-    }
-
-    pub fn new_headers_only<P>(method: Method, path: P, headers: Headers) -> Request
-        where P: Into<String>,
-    {
-        Request {
-            method: method,
-            path: path.into(),
-            headers_only: true,
-            headers: headers,
-        }
-    }
-}
-
-
-#[derive(Debug)]
-pub enum RequestError {
-    /// The remote end terminated this stream. No more data will arrive.
-    Reset,
-
-    /// request cannot be completed because the connection entered an error state
-    Connection,
-
-    /// Request cannot be completed because an error was returned from a stream handler method
-    User,
-
-    /// Received a GOAWAY frame on the connection where this request was being processed. This
-    /// stream was not handled by the server.
-    GoAwayUnprocessed(Http2ErrorCode),
-
-    /// Received a GOAWAY frame on the connection handling this request; this stream was potentially
-    /// processed by the server.
-    GoAwayMaybeProcessed(Http2ErrorCode),
-}
-
-impl ::std::error::Error for RequestError {
-    fn cause(&self) -> Option<&::std::error::Error> {
-        None
-    }
-
-    fn description(&self) -> &str {
-        match *self {
-            RequestError::Reset => "stream reset by peer",
-            RequestError::Connection => "connection encountered error",
-            RequestError::User => "error during stream handler call",
-            RequestError::GoAwayUnprocessed(_) => "GOAWAY frame received; stream not processed",
-            RequestError::GoAwayMaybeProcessed(_) => {
-                "GOAWAY frame received; stream maybe processed"
-            },
-        }
-    }
-}
-
-impl ::std::fmt::Display for RequestError {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        try!(write!(f, "Request failed because "));
-        match *self {
-            RequestError::Reset => write!(f, "stream was reset by peer"),
-            RequestError::Connection => write!(f, "connection encountered an error"),
-            RequestError::User => write!(f, "an error was returned from a stream handler call"),
-            RequestError::GoAwayUnprocessed(code) => {
-                write!(f, "Received a GOAWAY, stream unprocessed; code: {:?}", code)
-            },
-            RequestError::GoAwayMaybeProcessed(code) => {
-                write!(f, "Received a GOAWAY, stream maybe processed; code: {:?}", code)
-            },
-        }
     }
 }
 

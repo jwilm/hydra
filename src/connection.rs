@@ -4,8 +4,9 @@ use std::fmt;
 
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 
-use worker::{self, Worker};
 use protocol::{self, Protocol, Http2};
+use request;
+use worker::{self, Worker};
 
 /// Type that receives events for a connection
 pub trait Handler: Send + fmt::Debug + 'static {
@@ -158,8 +159,8 @@ impl Handle {
     }
 
     /// Notify the connection to create a new request stream from `req` and `handler`
-    pub fn request<H>(&self, req: ::Request, handler: H) -> SendResult<worker::Msg>
-        where H: protocol::StreamHandler
+    pub fn request<H>(&self, req: request::Request, handler: H) -> SendResult<worker::Msg>
+        where H: request::Handler
     {
         self.send(protocol::Msg::CreateStream(req, Box::new(handler)))
     }
