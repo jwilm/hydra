@@ -1,20 +1,87 @@
 //! Interactions with the I/O layer and the HTTP/2 state machine
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::fmt;
 
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 
 use worker::{self, Worker};
-use protocol::{self, Settings, Protocol, Http2};
-use super::ConnectionError;
-
+use protocol::{self, Protocol, Http2};
 
 /// Type that receives events for a connection
 pub trait Handler: Send + fmt::Debug + 'static {
     fn on_connection(&self, Handle);
-    fn on_error(&self, ConnectionError);
+    fn on_error(&self, Error);
     fn on_pong(&self);
 }
+
+/// Errors occurring in or when interacting with a connection
+///
+/// TODO separate internal errors
+#[derive(Debug)]
+pub enum Error {
+    /// IO layer encountered an error.
+    Io(io::Error),
+
+    /// Error from the HTTP/2 state machine; the connection cannot be used for sending further
+    /// requests.
+    Http(::solicit::http::HttpError),
+
+    /// Timeout while connecting
+    Timeout,
+
+    /// The worker is closing and a connection can not be created.
+    WorkerClosing,
+
+    /// The worker has reached its capacity for connections
+    WorkerFull,
+}
+
+impl ::std::error::Error for Error {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            Error::Io(ref err) => Some(err),
+            Error::Http(ref err) => Some(err),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            Error::Io(ref err) => err.description(),
+            Error::Http(ref err) => err.description(),
+            Error::Timeout => "timeout when attempting to connect",
+            Error::WorkerClosing => "worker isn't accepting new connections",
+            Error::WorkerFull => "worker cannot manage more connections",
+        }
+    }
+}
+
+impl ::std::fmt::Display for Error {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            Error::Io(ref err) => write!(f, "I/O error on connection: {}", err),
+            Error::Http(ref err) => write!(f, "HTTP/2 error on connection: {}", err),
+            Error::Timeout => write!(f, "Timeout during connect"),
+            Error::WorkerClosing => write!(f, "Worker not accepting new connections"),
+            Error::WorkerFull => write!(f, "Worker at connection capacity"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error::Io(err)
+    }
+}
+
+impl From<::solicit::http::HttpError> for Error {
+    fn from(val: ::solicit::http::HttpError) -> Error {
+        Error::Http(val)
+    }
+}
+
+/// Connection result type
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 /// An HTTP/2 connection
 ///
@@ -52,12 +119,12 @@ pub struct Ref<'a> {
     handler: &'a Handler,
     event_loop: &'a mut EventLoop<Worker>,
     token: mio::Token,
-    is_writable: bool,
 }
 
 /// Handle for a connection usable from other threads
 ///
-/// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection.
+/// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection. The
+/// connection handle is provided in the connection::Handler::on_connection method.
 #[derive(Debug, Clone)]
 pub struct Handle {
     // How many streams are currently active.
@@ -80,15 +147,21 @@ pub struct Handle {
     token: mio::Token,
 }
 
+/// Errors occurring when sending a message to the connection.
+pub type SendError<T> = mio::NotifyError<T>;
+pub type SendResult<T> = ::std::result::Result<(), SendError<T>>;
+
 impl Handle {
-    fn send(&self, msg: protocol::Msg) {
-        self.tx.send(worker::Msg::Protocol(self.token, msg));
+    /// Send a message to the worker's event loop
+    fn send(&self, msg: protocol::Msg) -> SendResult<worker::Msg> {
+        self.tx.send(worker::Msg::Protocol(self.token, msg))
     }
 
-    pub fn request<H>(&self, req: ::Request, handler: H)
+    /// Notify the connection to create a new request stream from `req` and `handler`
+    pub fn request<H>(&self, req: ::Request, handler: H) -> SendResult<worker::Msg>
         where H: protocol::StreamHandler
     {
-        self.send(protocol::Msg::CreateStream(req, Box::new(handler)));
+        self.send(protocol::Msg::CreateStream(req, Box::new(handler)))
     }
 }
 
@@ -139,7 +212,11 @@ impl<'a> DispatchConnectionEvent for Ref<'a> {
 
 impl Connection {
     pub fn on_connect_timeout(&self) {
-        self.handler.on_error(ConnectionError::Timeout);
+        self.on_error(Error::Timeout);
+    }
+
+    pub fn on_error(&self, err: Error) {
+        self.handler.on_error(err);
     }
 
     pub fn new(token: mio::Token, stream: mio::tcp::TcpStream, handler: Box<Handler>) -> Connection {
@@ -167,73 +244,92 @@ impl Connection {
             backlog: &mut self.backlog,
             token: self.token,
             handler: &*self.handler,
-            is_writable: self.is_writable,
         };
 
         self.protocol.initialize(conn_ref);
     }
 
-    pub fn ready(&mut self, event_loop: &mut EventLoop<Worker>, events: EventSet) {
+    pub fn ready(&mut self,
+                 event_loop: &mut EventLoop<Worker>,
+                 events: EventSet) -> Result<()>
+    {
         trace!("Connection ready: token={:?}; events={:?}", self.token, events);
         if events.is_readable() {
-            self.read(event_loop);
+            try!(self.read(event_loop));
         }
         if events.is_writable() {
             self.set_writable(true);
             // Whenever the connection becomes writable, we try a write.
-            self.try_write(event_loop).unwrap();
+            try!(self.try_write(event_loop));
         }
 
-        self.reregister(event_loop);
+        // TODO handle error event
+
+        try!(self.reregister(event_loop));
+
+        Ok(())
     }
 
-    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) {
+    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         let mut flags = mio::EventSet::readable();
         if !self.backlog.is_empty() || self.protocol.wants_write() {
             flags = flags | mio::EventSet::writable();
         }
 
         let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
-        event_loop.reregister(self.stream(), self.token, flags, pollopt);
+        Ok(try!(event_loop.reregister(self.stream(), self.token, flags, pollopt)))
     }
 
-    pub fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
+    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
+        Ok(try!(event_loop.deregister(self.stream())))
+    }
+
+    pub fn notify(&mut self,
+                  event_loop: &mut EventLoop<Worker>,
+                  msg: protocol::Msg) -> Result<()>
+    {
+        // The scope is necessary here since otherwise the borrow checker thinks
+        // the event_loop is borrowed too long and we can't call self.reregister.
         {
             let conn_ref = Ref {
                 event_loop: event_loop,
                 backlog: &mut self.backlog,
                 token: self.token,
                 handler: &*self.handler,
-                is_writable: self.is_writable,
             };
 
-            self.protocol.notify(msg, conn_ref);
+            // Notify the protocol
+            try!(self.protocol.notify(msg, conn_ref));
         }
-        self.reregister(event_loop);
+
+        // Reregister this connection on the event loop
+        try!(self.reregister(event_loop));
+
+        Ok(())
     }
 
-    fn read(&mut self, event_loop: &mut EventLoop<Worker>) {
+    fn read(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         // TODO Handle the case where the buffer isn't large enough to completely
         // exhaust the socket (since we're edge-triggered, we'd never get another
         // chance to read!)
         trace!("Handling read");
-        match self.stream.try_read_buf(&mut self.read_buf) {
-            Ok(Some(0)) => {
+        match try!(self.stream.try_read_buf(&mut self.read_buf)) {
+            Some(0) => {
                 debug!("EOF");
-                // EOF
+                // TODO EOF; should close connection and any remaining streams
             },
-            Ok(Some(n)) => {
+            Some(n) => {
                 debug!("read {} bytes", n);
                 let consumed = {
                     let conn_ref = Ref {
                         event_loop: event_loop,
                         token: self.token,
                         backlog: &mut self.backlog,
-                        is_writable: self.is_writable,
                         handler: &*self.handler,
                     };
                     let buf = &self.read_buf;
-                    self.protocol.on_data(buf, conn_ref).unwrap()
+
+                    try!(self.protocol.on_data(buf, conn_ref))
                 };
 
                 // TODO Would a circular buffer be better than draining here...?
@@ -248,17 +344,15 @@ impl Connection {
 
                 trace!("Done.");
             },
-            Ok(None) => {
+            None => {
                 trace!("read WOULDBLOCK");
             },
-            Err(e) => {
-                // TODO FIXME
-                panic!("got an error trying to read; err={:?}", e);
-            },
-        };
+        }
+
+        Ok(())
     }
 
-    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<(), ()> {
+    fn try_write(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
         trace!("-> Attempting to write!");
         if !self.is_writable {
             trace!("Currently not writable!");
@@ -276,10 +370,9 @@ impl Connection {
                     event_loop: event_loop,
                     token: self.token,
                     backlog: &mut self.backlog,
-                    is_writable: self.is_writable,
                     handler: &*self.handler,
                 };
-                self.protocol.ready_write(conn_ref);
+                try!(self.protocol.ready_write(conn_ref));
             }
 
             // Flush whatever the protocol might have added...
@@ -291,7 +384,7 @@ impl Connection {
         Ok(())
     }
 
-    fn write_backlog(&mut self) -> Result<(), ()> {
+    fn write_backlog(&mut self) -> Result<()> {
         loop {
             if self.backlog.is_empty() {
                 trace!("Backlog already empty.");
@@ -300,21 +393,18 @@ impl Connection {
             trace!("Trying a write from the backlog; items in backlog - {}", self.backlog.len());
             let status = {
                 let buf = &mut self.backlog[0];
-                match self.stream.try_write_buf(buf) {
-                    Ok(Some(_)) if buf.get_ref().len() == buf.position() as usize => {
+                match try!(self.stream.try_write_buf(buf)) {
+                    Some(_) if buf.get_ref().len() == buf.position() as usize => {
                         trace!("Full frame written!");
                         WriteStatus::Full
                     },
-                    Ok(Some(sz)) => {
+                    Some(sz) => {
                         trace!("Partial write: {} bytes", sz);
                         WriteStatus::Partial
                     },
-                    Ok(None) => {
+                    None => {
                         trace!("Write WOULDBLOCK");
                         WriteStatus::WouldBlock
-                    },
-                    Err(e) => {
-                        panic!("Error writing! {:?}", e);
                     },
                 }
             };

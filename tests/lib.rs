@@ -33,7 +33,7 @@ fn three_get_streams_one_worker() {
     let (tx, rx) = mpsc::channel();
     let handler = ConnectHandler::new(tx);
 
-    let cluster = Hydra::new(&config);
+    let cluster = Hydra::new(&config).unwrap();
     let mut collector = ResponseCollector::<HeadersOnlyHandler>::new();
 
     cluster.connect("http2bin.org:80", handler).unwrap();
@@ -46,7 +46,7 @@ fn three_get_streams_one_worker() {
 
     for _ in 0..3 {
         let req = Request::new_headers_only(Method::Get, "/get", Headers::new());
-        client.request(req, collector.new_stream_handler());
+        client.request(req, collector.new_stream_handler()).unwrap();
     }
 
     collector.wait_all();
@@ -66,7 +66,7 @@ fn three_workers_three_get_each() {
     let handler2 = ConnectHandler::new(tx.clone());
     let handler3 = ConnectHandler::new(tx.clone());
 
-    let cluster = Hydra::new(&config);
+    let cluster = Hydra::new(&config).unwrap();
     let mut collector = ResponseCollector::<HeadersOnlyHandler>::new();
 
     cluster.connect("http2bin.org:80", handler1).unwrap();
@@ -78,7 +78,7 @@ fn three_workers_three_get_each() {
         ConnectionMsg::Connected(conn) => {
             for _ in 0..3 {
                 let req = Request::new_headers_only(Method::Get, "/get", Headers::new());
-                conn.request(req, collector.new_stream_handler());
+                conn.request(req, collector.new_stream_handler()).unwrap();
             }
         },
         _ => panic!("Didn't recv Connected"),
@@ -105,7 +105,7 @@ fn make_some_post_requests() {
     let (tx, rx) = mpsc::channel();
     let handler = ConnectHandler::new(tx);
 
-    let cluster = Hydra::new(&config);
+    let cluster = Hydra::new(&config).unwrap();
     let mut collector = ResponseCollector::<BodyWriter<HelloWorld>>::new();
 
     cluster.connect("http2bin.org:80", handler).unwrap();
@@ -118,7 +118,7 @@ fn make_some_post_requests() {
 
     for _ in 0..3 {
         let req = Request::new(Method::Post, "/post", Headers::new());
-        client.request(req, collector.new_stream_handler());
+        client.request(req, collector.new_stream_handler()).unwrap();
     }
 
     collector.wait_all();
@@ -135,7 +135,7 @@ fn error_during_data_stream() {
     let (tx, rx) = mpsc::channel();
     let handler = ConnectHandler::new(tx);
 
-    let cluster = Hydra::new(&config);
+    let cluster = Hydra::new(&config).unwrap();
     let mut collector = ResponseCollector::<HandlerStreamError>::new();
 
     cluster.connect("http2bin.org:80", handler).unwrap();
@@ -147,7 +147,7 @@ fn error_during_data_stream() {
     };
 
     let req = Request::new(Method::Post, "/post", Headers::new());
-    client.request(req, collector.new_stream_handler());
+    client.request(req, collector.new_stream_handler()).unwrap();
 
     collector.wait_all();
     let messages = collector.messages();
@@ -163,6 +163,4 @@ fn error_during_data_stream() {
             _ => panic!("did not expect valid response: {:?}", message),
         }
     }
-
-    ::std::thread::sleep(::std::time::Duration::from_secs(1));
 }

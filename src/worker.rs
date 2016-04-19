@@ -2,20 +2,56 @@
 //!
 //! Workers contain a mio event loop, per connection HTTP/2 state (stream management, flow control,
 //! etc), and a state object accessible from the handle.
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::convert::From;
 use std::thread::JoinHandle;
-use std::io::Cursor;
 
 use mio::tcp::TcpStream;
 use mio::util::Slab;
 use mio::{self, Token, EventSet, EventLoop};
 
-use protocol::{self, Protocol, Http2};
+use protocol::{self, Protocol};
 use connection::{self, Connection};
 use util::thread;
 
-use super::ConnectionError;
+/// Errors that may occur when interacting with a worker
+#[derive(Debug)]
+pub enum Error {
+    Unavailable(mio::NotifyError<Msg>),
+}
+
+impl ::std::error::Error for Error {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            Error::Unavailable(ref err) => Some(err),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            Error::Unavailable(_) => "worker is unavailable",
+        }
+    }
+}
+
+impl ::std::fmt::Display for Error {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            Error::Unavailable(ref err) => {
+                write!(f, "worker is unavailable; failed to notify: {}", err)
+            },
+        }
+    }
+}
+
+impl From<mio::NotifyError<Msg>> for Error {
+    fn from(val: mio::NotifyError<Msg>) -> Error {
+        Error::Unavailable(val)
+    }
+}
+
+/// worker result type
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 /// Messages sent to the worker
 #[derive(Debug)]
@@ -35,30 +71,19 @@ pub enum Timer {
     Connect(Token),
 }
 
-/// Contains state relevant for managing a worker.
-pub struct Info {
-    /// Number of active worker connections
-    ///
-    /// Workers have a maximum number of connections they can handle. Tracking active_connections is
-    /// necessary so that higher level code can avoid requesting a new connection when the pool is
-    /// full.
-    active_connections: AtomicUsize,
-}
-
-
 /// The Worker lives on its own thread managing I/O for HTTP/2 requests.
 ///
 /// The Worker struct resides on its own thread. Interacting with the worker is completed through
 /// the handle.
 pub struct Worker {
-    /// Shared info about this worker
-    info: Arc<Info>,
-
     /// Connect timeout
-    connect_timeout_ms: u32,
+    connect_timeout_ms: u64,
 
     /// Connections
     connections: Slab<Connection>,
+
+    /// Timeouts
+    connect_timers: HashMap<mio::Token, mio::Timeout>,
 
     /// True when the worker is cleaning up and shutting down
     closing: bool,
@@ -78,9 +103,6 @@ pub struct Handle {
     /// The thread handle is stored in an option so the thread can be joined without consuming the
     /// handle.
     thread: Option<JoinHandle<()>>,
-
-    /// Info for managed worker
-    info: Arc<Info>,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -88,11 +110,6 @@ pub struct Handle {
 // -------------------------------------------------------------------------------------------------
 
 impl Handle {
-    /// Get worker info
-    pub fn info(&self) -> &Info {
-        &*self.info
-    }
-
     /// Terminate the worker
     ///
     /// Any errors occurring during join are logged. Terminate may be called multiple times, but it
@@ -106,32 +123,11 @@ impl Handle {
     }
 
     /// Worker should create a new connection with the given TcpStream
-    pub fn connect(&self, stream: TcpStream, handler: Box<connection::Handler>) {
-        self.tx.send(Msg::CreatePlaintextConnection(stream, handler));
-    }
-}
-
-// -------------------------------------------------------------------------------------------------
-// Info impls
-// -------------------------------------------------------------------------------------------------
-
-impl Info {
-    /// Create a new Info struct.
-    pub fn new() -> Info {
-        Default::default()
-    }
-
-    /// Number of active connections for the worker
-    pub fn active_connections(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for Info {
-    fn default() -> Info {
-        Info {
-            active_connections: AtomicUsize::new(0),
-        }
+    pub fn connect(&self,
+                   stream: TcpStream,
+                   handler: Box<connection::Handler>) -> Result<()>
+    {
+        Ok(try!(self.tx.send(Msg::CreatePlaintextConnection(stream, handler))))
     }
 }
 
@@ -143,15 +139,14 @@ impl Worker {
     /// Create a new worker
     ///
     /// Spawns a new thread with a worker using config. A `Handle` for the Worker thread is retured.
-    pub fn spawn(config: &::Config) -> Handle {
+    pub fn spawn(config: &::Config) -> Result<Handle> {
         trace!("spawning a hydra worker");
-        let info = Arc::new(Info::new());
 
         let mut worker = Worker {
             connect_timeout_ms: config.connect_timeout_ms,
-            info: info.clone(),
             connections: Slab::new(config.conns_per_thread),
             closing: false,
+            connect_timers: HashMap::new(),
         };
 
         let mut event_loop = EventLoop::new().expect("create event loop");
@@ -161,11 +156,10 @@ impl Worker {
             worker.run(&mut event_loop);
         });
 
-        Handle {
-            info: info,
+        Ok(Handle {
             tx: sender,
             thread: Some(join_handle),
-        }
+        })
     }
 
     /// Create a new connection given the handler and stream
@@ -177,15 +171,42 @@ impl Worker {
                       stream: TcpStream,
                       handler: Box<connection::Handler>)
     {
-        self.connections.insert_with(|token| {
-            let events = EventSet::readable() | EventSet::writable();
-            let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
-            event_loop.register(&stream, token, events, pollopt);
+        // first check that there is room in the slab such that `insert_with` will succeed.
+        if !self.connections.has_remaining() {
+            handler.on_error(connection::Error::WorkerFull);
+            return
+        }
 
+        // Create and insert the connection. Panic if this fails since the has_remaining check
+        // should have guaranteed it.
+        let token = self.connections.insert_with(|token| {
+            // Create/initialize connection. The connection is returned so it's added to the slab.
             let mut conn = Connection::new(token, stream, handler);
             conn.initialize(event_loop);
             conn
-        });
+        }).expect("connections had remaining");
+
+        // Register for read/write events
+        let events = EventSet::readable() | EventSet::writable();
+        let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
+        match {
+            let connection = &self.connections[token];
+            event_loop.register(connection.stream(), token, events, pollopt)
+        } {
+            Ok(()) => (),
+            Err(err) => {
+                // On error, remove the connection
+                let connection = self.connections.remove(token).expect("just inserted connection");
+                connection.on_error(From::from(err));
+                return;
+            }
+        }
+
+        // Set timeout for connect
+        let timer = event_loop.timeout_ms(Timer::Connect(token), self.connect_timeout_ms)
+                              .unwrap();
+        self.connect_timers.insert(token, timer);
+
     }
 
     /// Main function for the worker thread
@@ -193,12 +214,37 @@ impl Worker {
     /// Runs the event loop indefinitely until shutdown is called.
     pub fn run(&mut self, event_loop: &mut EventLoop<Worker>) {
         info!("worker running");
-        event_loop.run(self);
+
+        event_loop.run(self).expect("event_loop run is ok");
 
         // TODO remaining connections need to finish their work, close out streams, etc. Raise a
         // flag on each of the connections that shutdown is happening so new requests are rejected.
         self.closing = true;
         info!("worker terminated");
+        unimplemented!();
+    }
+
+    /// Handler for errors in a connection
+    ///
+    /// The connection is removed from the state object and deregistered from the event loop.
+    pub fn connection_error(&mut self,
+                            event_loop: &mut EventLoop<Worker>,
+                            token: Token,
+                            err: connection::Error)
+    {
+        let mut connection = self.connections.remove(token).expect("connection in slab");
+
+        // Deregister might return an error here if the token isn't registered. We don't care
+        // about that error or any other as we are just removing the connection.
+        connection.deregister(event_loop).ok();
+
+        // TODO should this handle notifying the stream handlers of an error? The protocol
+        // handles this in certain cases already, so doing so here would result in a double
+        // notify. I'm inclined to not handle that here and just insist the protocol closes out
+        // any active streams in the event of an unrecoverable error.
+
+        // Run connection error handler.
+        connection.on_error(err);
     }
 }
 
@@ -211,7 +257,9 @@ impl mio::Handler for Worker {
              token: Token,
              events: EventSet)
     {
-        self.connections[token].ready(event_loop, events);
+        if let Err(err) = self.connections[token].ready(event_loop, events) {
+            self.connection_error(event_loop, token, err);
+        }
     }
 
     fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: Msg) {
@@ -219,13 +267,21 @@ impl mio::Handler for Worker {
         match msg {
             Msg::CreatePlaintextConnection(stream, handler) => {
                 if self.closing {
-                    handler.on_error(ConnectionError::WorkerClosing);
+                    handler.on_error(connection::Error::WorkerClosing);
                 } else {
                     self.add_connection(event_loop, stream, handler);
                 }
             },
             Msg::Protocol(token, protocol_msg) => {
-                self.connections[token].notify(event_loop, protocol_msg);
+                if let Err(err) = {
+                    if let Some(connection) = self.connections.get_mut(token) {
+                        connection.notify(event_loop, protocol_msg)
+                    } else {
+                        Ok(())
+                    }
+                } {
+                    self.connection_error(event_loop, token, err);
+                }
             },
             Msg::Terminate => {
                 if !self.closing {
@@ -242,7 +298,9 @@ impl mio::Handler for Worker {
                 // If a ConnectTimeout arrives, that means the connection has not been established.
                 // Remove the connection and run the timeout handler.
                 if let Some(conn) = self.connections.remove(token) {
-                    event_loop.deregister(conn.stream());
+                    // Deregister probably won't return an error here. There's nothing we can do if
+                    // it does anyway, so just ignore it.
+                    event_loop.deregister(conn.stream()).ok();
                     conn.on_connect_timeout();
                 }
             }

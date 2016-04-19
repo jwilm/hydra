@@ -1,5 +1,8 @@
 //! Hydra - An evented HTTP/2 client library
 //!
+#![deny(unused_variables)]
+#![deny(unused_imports)]
+#![deny(dead_code)]
 extern crate mio;
 extern crate solicit;
 extern crate hyper;
@@ -13,17 +16,13 @@ extern crate openssl;
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::cell::Cell;
-use std::net::{self, SocketAddr, ToSocketAddrs};
-use std::str::FromStr;
+use std::net::ToSocketAddrs;
 use std::io;
 
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
 pub use hyper::status::{StatusCode, StatusClass};
 pub use hyper::header::{Headers};
-
-use solicit::http::session;
 
 pub mod worker;
 pub mod util;
@@ -39,32 +38,75 @@ pub use protocol::Response;
 pub use protocol::StreamDataState;
 
 pub use connection::Handler as ConnectionHandler;
+pub use ::solicit::http::ErrorCode as Http2ErrorCode;
 
 pub trait Connector: Send + 'static {}
 
 use util::each_addr;
 
-// pub struct TlsConnector;
-// impl Connector for TlsConnector {}
-
 pub struct PlaintextConnector;
 impl Connector for PlaintextConnector {}
 
 pub struct Config {
-    pub threads: u8,
-    pub connect_timeout_ms: u32,
+    pub connect_timeout_ms: u64,
     pub conns_per_thread: usize,
+    pub threads: u8,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
-            threads: 8,
             connect_timeout_ms: 60_000,
             conns_per_thread: 1_024,
+            threads: 8,
         }
     }
 }
+
+#[derive(Debug)]
+pub enum HydraError {
+    Io(io::Error),
+    Worker(worker::Error),
+}
+
+impl ::std::error::Error for HydraError {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            HydraError::Io(ref err) => Some(err),
+            HydraError::Worker(ref err) => Some(err),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            HydraError::Io(_) => "encountered an I/O error",
+            HydraError::Worker(ref err) => err.description(),
+        }
+    }
+}
+
+impl ::std::fmt::Display for HydraError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            HydraError::Io(ref err) => write!(f, "Hydra encountered an I/O error: {}", err),
+            HydraError::Worker(ref err) => write!(f, "Hydra worker encountered error: {}", err),
+        }
+    }
+}
+
+impl From<worker::Error> for HydraError {
+    fn from(val: worker::Error) -> HydraError {
+        HydraError::Worker(val)
+    }
+}
+
+impl From<io::Error> for HydraError {
+    fn from(val: io::Error) -> HydraError {
+        HydraError::Io(val)
+    }
+}
+
+pub type Result<T> = ::std::result::Result<T, HydraError>;
 
 /// Interface to evented HTTP/2 client worker pool
 pub struct Hydra {
@@ -73,24 +115,24 @@ pub struct Hydra {
 }
 
 impl Hydra {
-    pub fn new(config: &Config) -> Hydra {
+    pub fn new(config: &Config) -> Result<Hydra> {
         info!("spawning a hydra");
 
         let mut workers = Vec::new();
         for _ in 0..config.threads {
-            workers.push(Worker::spawn(config));
+            workers.push(try!(Worker::spawn(config)));
         }
 
-        Hydra {
+        Ok(Hydra {
             workers: workers,
             next: AtomicUsize::new(0),
-        }
+        })
     }
 
     /// Connect to a host on plaintext transport
     ///
     /// FIXME U should be ToSocketAddrs
-    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<()>
+    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> Result<()>
         where U: ToSocketAddrs,
               H: ConnectionHandler,
     {
@@ -101,7 +143,7 @@ impl Hydra {
         let next = self.next.fetch_add(1, Ordering::SeqCst);
         let ref worker = self.workers[next % self.workers.len()];
 
-        worker.connect(stream, Box::new(handler));
+        try!(worker.connect(stream, Box::new(handler)));
 
         Ok(())
     }
@@ -167,25 +209,6 @@ impl Request {
     }
 }
 
-#[derive(Debug)]
-pub enum ConnectionError {
-    /// IO layer encountered an error.
-    Io(io::Error),
-
-    /// Timeout while connecting
-    Timeout,
-
-    /// The worker is closing and a connection can not be created.
-    WorkerClosing,
-}
-
-impl From<io::Error> for ConnectionError {
-    fn from(err: io::Error) -> ConnectionError {
-        ConnectionError::Io(err)
-    }
-}
-
-pub type ConnectionResult<T> = ::std::result::Result<T, ConnectionError>;
 
 #[derive(Debug)]
 pub enum RequestError {
@@ -197,6 +220,14 @@ pub enum RequestError {
 
     /// Request cannot be completed because an error was returned from a stream handler method
     User,
+
+    /// Received a GOAWAY frame on the connection where this request was being processed. This
+    /// stream was not handled by the server.
+    GoAwayUnprocessed(Http2ErrorCode),
+
+    /// Received a GOAWAY frame on the connection handling this request; this stream was potentially
+    /// processed by the server.
+    GoAwayMaybeProcessed(Http2ErrorCode),
 }
 
 impl ::std::error::Error for RequestError {
@@ -209,6 +240,10 @@ impl ::std::error::Error for RequestError {
             RequestError::Reset => "stream reset by peer",
             RequestError::Connection => "connection encountered error",
             RequestError::User => "error during stream handler call",
+            RequestError::GoAwayUnprocessed(_) => "GOAWAY frame received; stream not processed",
+            RequestError::GoAwayMaybeProcessed(_) => {
+                "GOAWAY frame received; stream maybe processed"
+            },
         }
     }
 }
@@ -220,6 +255,12 @@ impl ::std::fmt::Display for RequestError {
             RequestError::Reset => write!(f, "stream was reset by peer"),
             RequestError::Connection => write!(f, "connection encountered an error"),
             RequestError::User => write!(f, "an error was returned from a stream handler call"),
+            RequestError::GoAwayUnprocessed(code) => {
+                write!(f, "Received a GOAWAY, stream unprocessed; code: {:?}", code)
+            },
+            RequestError::GoAwayMaybeProcessed(code) => {
+                write!(f, "Received a GOAWAY, stream maybe processed; code: {:?}", code)
+            },
         }
     }
 }
