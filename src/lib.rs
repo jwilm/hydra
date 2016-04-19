@@ -1,5 +1,8 @@
 //! Hydra - An evented HTTP/2 client library
 //!
+#![deny(unused_variables)]
+#![deny(unused_imports)]
+#![deny(dead_code)]
 extern crate mio;
 extern crate solicit;
 extern crate hyper;
