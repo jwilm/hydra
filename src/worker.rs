@@ -2,16 +2,13 @@
 //!
 //! Workers contain a mio event loop, per connection HTTP/2 state (stream management, flow control,
 //! etc), and a state object accessible from the handle.
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::io::Cursor;
 
 use mio::tcp::TcpStream;
 use mio::util::Slab;
 use mio::{self, Token, EventSet, EventLoop};
 
-use protocol::{self, Protocol, Http2};
+use protocol::{self, Protocol};
 use connection::{self, Connection};
 use util::thread;
 
@@ -35,25 +32,11 @@ pub enum Timer {
     Connect(Token),
 }
 
-/// Contains state relevant for managing a worker.
-pub struct Info {
-    /// Number of active worker connections
-    ///
-    /// Workers have a maximum number of connections they can handle. Tracking active_connections is
-    /// necessary so that higher level code can avoid requesting a new connection when the pool is
-    /// full.
-    active_connections: AtomicUsize,
-}
-
-
 /// The Worker lives on its own thread managing I/O for HTTP/2 requests.
 ///
 /// The Worker struct resides on its own thread. Interacting with the worker is completed through
 /// the handle.
 pub struct Worker {
-    /// Shared info about this worker
-    info: Arc<Info>,
-
     /// Connect timeout
     connect_timeout_ms: u32,
 
@@ -78,9 +61,6 @@ pub struct Handle {
     /// The thread handle is stored in an option so the thread can be joined without consuming the
     /// handle.
     thread: Option<JoinHandle<()>>,
-
-    /// Info for managed worker
-    info: Arc<Info>,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -88,11 +68,6 @@ pub struct Handle {
 // -------------------------------------------------------------------------------------------------
 
 impl Handle {
-    /// Get worker info
-    pub fn info(&self) -> &Info {
-        &*self.info
-    }
-
     /// Terminate the worker
     ///
     /// Any errors occurring during join are logged. Terminate may be called multiple times, but it
@@ -112,30 +87,6 @@ impl Handle {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Info impls
-// -------------------------------------------------------------------------------------------------
-
-impl Info {
-    /// Create a new Info struct.
-    pub fn new() -> Info {
-        Default::default()
-    }
-
-    /// Number of active connections for the worker
-    pub fn active_connections(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for Info {
-    fn default() -> Info {
-        Info {
-            active_connections: AtomicUsize::new(0),
-        }
-    }
-}
-
-// -------------------------------------------------------------------------------------------------
 // Worker impls
 // -------------------------------------------------------------------------------------------------
 
@@ -145,11 +96,9 @@ impl Worker {
     /// Spawns a new thread with a worker using config. A `Handle` for the Worker thread is retured.
     pub fn spawn(config: &::Config) -> Handle {
         trace!("spawning a hydra worker");
-        let info = Arc::new(Info::new());
 
         let mut worker = Worker {
             connect_timeout_ms: config.connect_timeout_ms,
-            info: info.clone(),
             connections: Slab::new(config.conns_per_thread),
             closing: false,
         };
@@ -162,7 +111,6 @@ impl Worker {
         });
 
         Handle {
-            info: info,
             tx: sender,
             thread: Some(join_handle),
         }
@@ -212,12 +160,9 @@ impl mio::Handler for Worker {
              events: EventSet)
     {
         if let Err(err) = self.connections[token].ready(event_loop, events) {
-            // TODO connection abnormal shutdown
-            // 1. deregister connection (and remove from self.connections)
-            // 2. call connection error handler
-            panic!("unhandled io error: {}", err);
             let mut connection = self.connections.remove(token).expect("connection in slab");
             connection.deregister(event_loop);
+            connection.on_error(err);
         }
     }
 

@@ -1,19 +1,16 @@
-use std::sync::mpsc;
 use std::fmt;
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
-use solicit::http::frame::{self, Frame, RawFrame, FrameIR, HttpSetting};
+use solicit::http::frame::{self, RawFrame, FrameIR, HttpSetting};
 use solicit::http::{HttpScheme, HttpResult, Header, StreamId, ErrorCode};
-use solicit::http::priority::{DataPrioritizer, SimplePrioritizer};
+use solicit::http::priority::DataPrioritizer;
 use solicit::http::connection::{HttpConnection, SendFrame, ReceiveFrame, HttpFrame, EndStream};
 use solicit::http::connection::SendStatus;
 use solicit::http::connection::DataChunk;
 use solicit::http::HttpError;
-use solicit::http::client::{write_preface, ClientConnection, RequestStream};
-use solicit::http::session::{DefaultSessionState, SessionState, DefaultStream, StreamState};
+use solicit::http::client::{write_preface, RequestStream};
+use solicit::http::session::{DefaultSessionState, SessionState, StreamState};
 use solicit::http::session::{self, Stream as SessionStream};
 
 use super::RequestError;
@@ -23,7 +20,6 @@ use hyper::header::Headers;
 use connection::{self, DispatchConnectionEvent};
 
 use header;
-use StatusCode;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
@@ -146,7 +142,7 @@ pub trait Protocol: Sized + 'static {
     fn new() -> Self;
     fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> HttpResult<usize>;
     fn ready_write(&mut self, conn: connection::Ref);
-    fn notify(&mut self, msg: Msg, conn: connection::Ref);
+    fn notify(&mut self, msg: Msg, conn: connection::Ref) -> HttpResult<()>;
 }
 
 /// Messages for an HTTP/2 state machine
@@ -240,9 +236,9 @@ impl session::Stream for Stream {
         self.inner.on_response_data(data)
     }
 
-    // TODO need this to optionally return an error so we can handle header parsing failing and the
-    // protocol can reset the stream.
-    fn set_headers(&mut self, headers: Vec<Header>) {
+    fn set_headers(&mut self, _headers: Vec<Header>) {
+        // This method is unused since the type signature does not support parsing headers as the
+        // hyper headers type (needs ability to return an error).
         unimplemented!();
     }
 
@@ -254,7 +250,7 @@ impl session::Stream for Stream {
         }
     }
 
-    fn get_data_chunk(&mut self, buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError> {
+    fn get_data_chunk(&mut self, _buf: &mut [u8]) -> Result<StreamDataChunk, StreamDataError> {
         unreachable!();
     }
 
@@ -364,7 +360,7 @@ impl Http2 {
     ///
     /// For now it does not perform any validation whether the given `RequestStream` is valid.
     pub fn start_request<S: SendFrame>(&mut self,
-                                       mut req: RequestStream<Stream>,
+                                       req: RequestStream<Stream>,
                                        sender: &mut S)
                                        -> HttpResult<StreamId> {
 
@@ -522,37 +518,27 @@ impl Protocol for Http2 {
         trace!("on_data");
         let mut total_consumed = 0;
         loop {
-            match WrappedReceive::parse(&buf[total_consumed..]) {
-                None => {
-                    // No frame available yet. We consume nothing extra and wait for more data to
-                    // become available to retry.
-                    let done = self.state.get_closed();
-                    for stream in done {
-                        info!("Got response!");
-                    }
+            if let Some(mut receiver) = WrappedReceive::parse(&buf[total_consumed..]) {
+                let len = receiver.frame().len();
+                debug!("Handling an HTTP/2 frame of total size {}", len);
 
-                    break;
-                },
-                Some(mut receiver) => {
-                    let len = receiver.frame().len();
-                    debug!("Handling an HTTP/2 frame of total size {}", len);
-
-                    if !self.got_settings {
-                        {
-                            let mut sender = SendDirect { conn: &mut conn };
-                            // TODO protocol error if this errors
-                            try!(self.expect_settings(&mut receiver, &mut sender));
-                        }
-
-                        self.got_settings = true;
-                        conn.connection_ready();
-                    } else {
+                if !self.got_settings {
+                    {
                         let mut sender = SendDirect { conn: &mut conn };
-                        try!(self.handle_next_frame(&mut receiver, &mut sender));
+                        // TODO protocol error if this errors
+                        try!(self.expect_settings(&mut receiver, &mut sender));
                     }
 
-                    total_consumed += len;
-                },
+                    self.got_settings = true;
+                    conn.connection_ready();
+                } else {
+                    let mut sender = SendDirect { conn: &mut conn };
+                    try!(self.handle_next_frame(&mut receiver, &mut sender));
+                }
+
+                total_consumed += len;
+            } else {
+                break;
             }
         }
 
@@ -572,7 +558,7 @@ impl Protocol for Http2 {
         self.send_next_data(&mut sender);
     }
 
-    fn notify(&mut self, msg: Msg, mut conn: connection::Ref) {
+    fn notify(&mut self, msg: Msg, mut conn: connection::Ref) -> HttpResult<()> {
         // A sender is needed for all message variants
         let mut sender = SendDirect { conn: &mut conn };
         match msg {
@@ -581,9 +567,11 @@ impl Protocol for Http2 {
                 self.start_request(stream, &mut sender);
             },
             Msg::Ping => {
-                self.send_ping(&mut sender);
+                try!(self.send_ping(&mut sender));
             }
         }
+
+        Ok(())
     }
 }
 
@@ -665,7 +653,7 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
         debug!("Headers for stream {}", stream_id);
         let (status_code, headers) = match header::to_status_and_headers(headers) {
             Ok(vals) => vals,
-            Err(err) => {
+            Err(_err) => {
                 // Headers not provided according to HTTP protocol; reset the stream.
                 try!(self.rst_stream(stream_id, ErrorCode::ProtocolError, conn));
                 return Ok(());
@@ -748,7 +736,7 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
                  last_stream_id: StreamId,
                  error_code: ErrorCode,
                  debug_data: Option<&[u8]>,
-                 conn: &mut HttpConnection) -> HttpResult<()>
+                 _conn: &mut HttpConnection) -> HttpResult<()>
     {
         use ::solicit::http::ConnectionError;
 

@@ -13,17 +13,13 @@ extern crate openssl;
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::cell::Cell;
-use std::net::{self, SocketAddr, ToSocketAddrs};
-use std::str::FromStr;
+use std::net::ToSocketAddrs;
 use std::io;
 
 // Would be cool if these got put into separate crates
 pub use hyper::method::Method;
 pub use hyper::status::{StatusCode, StatusClass};
 pub use hyper::header::{Headers};
-
-use solicit::http::session;
 
 pub mod worker;
 pub mod util;

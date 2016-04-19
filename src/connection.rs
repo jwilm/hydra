@@ -5,7 +5,7 @@ use std::fmt;
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
 
 use worker::{self, Worker};
-use protocol::{self, Settings, Protocol, Http2};
+use protocol::{self, Protocol, Http2};
 use super::ConnectionError;
 use super::ConnectionResult;
 
@@ -52,7 +52,6 @@ pub struct Ref<'a> {
     handler: &'a Handler,
     event_loop: &'a mut EventLoop<Worker>,
     token: mio::Token,
-    is_writable: bool,
 }
 
 /// Handle for a connection usable from other threads
@@ -139,7 +138,11 @@ impl<'a> DispatchConnectionEvent for Ref<'a> {
 
 impl Connection {
     pub fn on_connect_timeout(&self) {
-        self.handler.on_error(ConnectionError::Timeout);
+        self.on_error(ConnectionError::Timeout);
+    }
+
+    pub fn on_error(&self, err: ConnectionError) {
+        self.handler.on_error(err);
     }
 
     pub fn new(token: mio::Token, stream: mio::tcp::TcpStream, handler: Box<Handler>) -> Connection {
@@ -167,7 +170,6 @@ impl Connection {
             backlog: &mut self.backlog,
             token: self.token,
             handler: &*self.handler,
-            is_writable: self.is_writable,
         };
 
         self.protocol.initialize(conn_ref);
@@ -206,7 +208,10 @@ impl Connection {
         event_loop.deregister(self.stream())
     }
 
-    pub fn notify(&mut self, event_loop: &mut EventLoop<Worker>, msg: protocol::Msg) {
+    pub fn notify(&mut self,
+                  event_loop: &mut EventLoop<Worker>,
+                  msg: protocol::Msg) -> ConnectionResult<()>
+    {
         // The scope is necessary here since otherwise the borrow checker thinks
         // the event_loop is borrowed too long and we can't call self.reregister.
         {
@@ -215,15 +220,16 @@ impl Connection {
                 backlog: &mut self.backlog,
                 token: self.token,
                 handler: &*self.handler,
-                is_writable: self.is_writable,
             };
 
             // Notify the protocol
-            self.protocol.notify(msg, conn_ref);
+            try!(self.protocol.notify(msg, conn_ref));
         }
 
         // Reregister this connection on the event loop
         self.reregister(event_loop);
+
+        Ok(())
     }
 
     fn read(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
@@ -243,7 +249,6 @@ impl Connection {
                         event_loop: event_loop,
                         token: self.token,
                         backlog: &mut self.backlog,
-                        is_writable: self.is_writable,
                         handler: &*self.handler,
                     };
                     let buf = &self.read_buf;
@@ -289,7 +294,6 @@ impl Connection {
                     event_loop: event_loop,
                     token: self.token,
                     backlog: &mut self.backlog,
-                    is_writable: self.is_writable,
                     handler: &*self.handler,
                 };
                 self.protocol.ready_write(conn_ref);
