@@ -257,6 +257,8 @@ impl mio::Handler for Worker {
              token: Token,
              events: EventSet)
     {
+        self.connect_timers.remove(&token);
+
         if let Err(err) = self.connections[token].ready(event_loop, events) {
             self.connection_error(event_loop, token, err);
         }
@@ -305,6 +307,5 @@ impl mio::Handler for Worker {
                 }
             }
         }
-        unimplemented!();
     }
 }

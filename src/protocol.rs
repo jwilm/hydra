@@ -19,7 +19,6 @@ use request;
 
 pub use solicit::http::session::{StreamDataChunk, StreamDataError};
 
-
 /// Upon successfully reading from a stream, ReadInfo is provided in the StreamDataState
 #[derive(Debug, Eq, PartialEq)]
 pub enum ReadInfo {
@@ -163,9 +162,13 @@ impl<'a> ReceiveFrame for WrappedReceive<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Stream {
     state: session::StreamState,
     inner: Box<request::Handler>,
+    errored: bool,
+    bytes_received: usize,
+    headers_received: bool,
 }
 
 impl Stream {
@@ -175,11 +178,15 @@ impl Stream {
             // TODO should really start in Idle state
             state: session::StreamState::Open,
             inner: handler,
+            errored: false,
+            bytes_received: 0,
+            headers_received: false,
         }
     }
 
     #[inline]
     pub fn on_response(&mut self, res: request::Response) {
+        self.headers_received = true;
         self.inner.on_response(res);
     }
 
@@ -188,12 +195,15 @@ impl Stream {
     }
 
     fn on_error(&mut self, err: request::Error) {
+        info!("stream got error: {:?}", err);
+        self.errored = true;
         self.inner.on_error(err)
     }
 }
 
 impl session::Stream for Stream {
     fn new_data_chunk(&mut self, data: &[u8]) {
+        self.bytes_received += data.len();
         self.inner.on_response_data(data)
     }
 
@@ -207,7 +217,10 @@ impl session::Stream for Stream {
         trace!("protocol::Stream::set_state {:?}", state);
         self.state = state;
         if state == StreamState::Closed {
-            self.inner.on_close();
+            info!("stream closed");
+            if !self.errored {
+                self.inner.on_close();
+            }
         }
     }
 
@@ -218,6 +231,11 @@ impl session::Stream for Stream {
     /// Returns the current state of the stream.
     fn state(&self) -> StreamState {
         self.state
+    }
+
+    fn on_rst_stream(&mut self, error_code: ErrorCode) {
+        self.on_error(request::Error::Reset(error_code));
+        self.close();
     }
 }
 
@@ -231,6 +249,9 @@ pub struct Http2 {
 
     /// Streams with active interest in writing data
     interest: HashSet<StreamId>,
+
+    /// Queued requests
+    queued: Vec<RequestStream<'static, 'static, Stream>>
 }
 
 /// Settings type that exposes some properties via Send/Sync types
@@ -313,7 +334,8 @@ impl Http2 {
                                                                   rx: &mut Recv,
                                                                   tx: &mut Sender)
                                                                   -> HttpResult<()> {
-        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings);
+        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings,
+                                             &mut self.interest);
         self.conn.expect_settings(rx, &mut session)
     }
 
@@ -357,7 +379,8 @@ impl Http2 {
                                                                     -> HttpResult<()> {
         trace!("handle_next_frame");
         // TODO apparently handle_next_frame will return an error when GOAWAY is received
-        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings);
+        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings,
+                                             &mut self.interest);
         self.conn.handle_next_frame(rx, &mut session)
     }
 
@@ -370,6 +393,9 @@ impl Http2 {
         // A default "maximum" chunk size of 8 KiB is set on all data frames.
         const MAX_CHUNK_SIZE: usize = 8_192;
         let mut buf = [0; MAX_CHUNK_SIZE];
+
+        // First start pending requests
+        try!(self.start_queued_requests(sender));
 
         if let Some(stream_result) = Http2::get_stream_data(&self.interest,
                                                             &mut self.state, &mut buf[..]) {
@@ -400,7 +426,7 @@ impl Http2 {
                 // case of Unavailable.
                 StreamDataState::Unavailable => unreachable!(),
                 StreamDataState::Error => {
-                    try!(self.rst_stream(id, ErrorCode::InternalError, sender));
+                    try!(self.initiate_stream_reset(id, ErrorCode::InternalError, sender));
                 },
             }
         }
@@ -413,10 +439,10 @@ impl Http2 {
     /// Processing the stream identified by `id` has failed locally. Send a RST_STREAM frame to our
     /// peer, remove the stream from the state machine, and run the on_error callback for the
     /// stream.
-    fn rst_stream<S: SendFrame>(&mut self,
-                                id: StreamId,
-                                code: ErrorCode,
-                                sender: &mut S) -> HttpResult<()>
+    fn initiate_stream_reset<S: SendFrame>(&mut self,
+                                           id: StreamId,
+                                           code: ErrorCode,
+                                           sender: &mut S) -> HttpResult<()>
     {
         // Send RST_STREAM frame
         try!(self.conn.sender(sender).rst_stream(id, code));
@@ -456,8 +482,40 @@ impl Http2 {
         conn.queue_frame(buf);
     }
 
+    #[inline]
     pub fn wants_write(&self) -> bool {
-        !self.interest.is_empty()
+        !self.interest.is_empty() || self.can_start_requests()
+    }
+
+    #[inline]
+    fn can_start_requests(&self) -> bool {
+        !self.queued.is_empty() && !self.at_inflight_capacity()
+    }
+
+    fn at_inflight_capacity(&self) -> bool {
+        self.state.len() >= self.settings.max_concurrent_streams as usize
+    }
+
+    fn start_queued_requests<S>(&mut self, sender: &mut S) -> HttpResult<()>
+        where S: SendFrame
+    {
+        // very noisy log
+        // for (id, stream) in self.state.iter() {
+        //     trace!("state[{}] : {:?}", id, stream);
+        // }
+
+        while !self.queued.is_empty() {
+            if self.at_inflight_capacity() {
+                debug!("at in-flight capacity; can't start more");
+                break;
+            }
+
+            debug!("starting queued request");
+            let request = self.queued.pop().expect("not empty");
+            try!(self.start_request(request, sender));
+        }
+
+        Ok(())
     }
 }
 
@@ -472,6 +530,7 @@ impl Protocol for Http2 {
             got_settings: false,
             state: state,
             interest: HashSet::new(),
+            queued: Vec::new(),
         }
     }
 
@@ -525,12 +584,19 @@ impl Protocol for Http2 {
         match msg {
             Msg::CreateStream(request, handler) => {
                 let stream = Http2::new_stream(request, handler, self.conn.scheme);
-                try!(self.start_request(stream, &mut sender));
+                if self.at_inflight_capacity() {
+                    debug!("at in-flight capacity; queuing request");
+                    self.queued.push(stream);
+                } else {
+                    try!(self.start_request(stream, &mut sender));
+                }
             },
             Msg::Ping => {
                 try!(self.send_ping(&mut sender));
             }
         }
+
+        try!(self.start_queued_requests(&mut sender));
 
         Ok(())
     }
@@ -556,6 +622,7 @@ struct ClientSession<'a, G, S>
     state: &'a mut DefaultSessionState<session::Client, Stream>,
     sender: &'a mut S,
     settings: &'a mut G,
+    interest: &'a mut HashSet<StreamId>,
 }
 
 impl<'a, G, S> ClientSession<'a, G, S>
@@ -566,12 +633,14 @@ impl<'a, G, S> ClientSession<'a, G, S>
     #[inline]
     pub fn new(state: &'a mut DefaultSessionState<session::Client, Stream>,
                sender: &'a mut S,
-               settings: &'a mut G) -> ClientSession<'a, G, S>
+               settings: &'a mut G,
+               interest: &'a mut HashSet<StreamId>) -> ClientSession<'a, G, S>
     {
         ClientSession {
             state: state,
             sender: sender,
             settings: settings,
+            interest: interest,
         }
     }
 }
@@ -612,6 +681,7 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
             Ok(vals) => vals,
             Err(_err) => {
                 // Headers not provided according to HTTP protocol; reset the stream.
+                // TODO send stream reset - this is just handling a received one
                 try!(self.rst_stream(stream_id, ErrorCode::ProtocolError, conn));
                 return Ok(());
             },
@@ -630,27 +700,35 @@ impl<'a, G, S> session::Session for ClientSession<'a, G, S>
 
     fn end_of_stream(&mut self, stream_id: StreamId, _: &mut HttpConnection) -> HttpResult<()> {
         debug!("End of stream {}", stream_id);
-        let mut stream = match self.state.get_stream_mut(stream_id) {
-            None => {
-                debug!("Received a frame for an unknown stream!");
-                return Ok(());
-            }
-            Some(stream) => stream,
-        };
-        // Since this implies that the server has closed the stream (i.e. provided a response), we
-        // close the local end of the stream, as well as the remote one; there's no need to keep
-        // sending out the request body if the server's decided that it doesn't want to see it.
-        stream.close();
+
+        if let Some(mut stream) = self.state.remove_stream(stream_id) {
+            // Since this implies that the server has closed the stream (i.e. provided a response),
+            // we close the local end of the stream, as well as the remote one; there's no need to
+            // keep sending out the request body if the server's decided that it doesn't want to see
+            // it.
+            stream.close();
+        }
+
         Ok(())
     }
 
+    // Indicates a RST_STREAM from the remote peer
     fn rst_stream(&mut self,
                   stream_id: StreamId,
                   error_code: ErrorCode,
                   _: &mut HttpConnection) -> HttpResult<()>
     {
         debug!("RST_STREAM id={:?}, error={:?}", stream_id, error_code);
-        self.state.get_stream_mut(stream_id).map(|stream| stream.on_rst_stream(error_code));
+
+        // Don't try and stream data
+        self.interest.remove(&stream_id);
+
+        // Remove stream from the session state
+        if let Some(mut stream) = self.state.remove_stream(stream_id) {
+            // Let stream know it was Reset.
+            stream.on_rst_stream(error_code);
+        }
+
         Ok(())
     }
 

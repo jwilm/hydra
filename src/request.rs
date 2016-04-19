@@ -41,7 +41,7 @@ pub struct Response {
 #[derive(Debug)]
 pub enum Error {
     /// The remote end terminated this stream. No more data will arrive.
-    Reset,
+    Reset(Http2ErrorCode),
 
     /// request cannot be completed because the connection entered an error state
     Connection,
@@ -65,7 +65,7 @@ impl ::std::error::Error for Error {
 
     fn description(&self) -> &str {
         match *self {
-            Error::Reset => "stream reset by peer",
+            Error::Reset(_) => "stream reset by peer",
             Error::Connection => "connection encountered error",
             Error::User => "error during stream handler call",
             Error::GoAwayUnprocessed(_) => "GOAWAY frame received; stream not processed",
@@ -80,7 +80,7 @@ impl ::std::fmt::Display for Error {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         try!(write!(f, "Request failed because "));
         match *self {
-            Error::Reset => write!(f, "stream was reset by peer"),
+            Error::Reset(code) => write!(f, "stream was reset by peer: {:?}", code),
             Error::Connection => write!(f, "connection encountered an error"),
             Error::User => write!(f, "an error was returned from a stream handler call"),
             Error::GoAwayUnprocessed(code) => {

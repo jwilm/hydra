@@ -124,6 +124,39 @@ fn make_some_post_requests() {
 }
 
 #[test]
+fn concurrent_requests_greater_than_inflight_limit() {
+    util::enable_logging();
+
+    let mut config = hydra::Config::default();
+    config.threads = 1;
+
+    let (tx, rx) = mpsc::channel();
+    let handler = ConnectHandler::new(tx);
+
+    let cluster = Hydra::new(&config).unwrap();
+    let mut collector = ResponseCollector::<HeadersOnlyHandler>::new();
+
+    cluster.connect("http2bin.org:80", handler).unwrap();
+
+    // Wait for the connection.
+    let client = match rx.recv().unwrap() {
+        ConnectionMsg::Connected(conn) => conn,
+        _ => panic!("Didn't recv Connected"),
+    };
+
+    // http2bin maxes at 100 in flight
+    for _ in 0..150 {
+        let req = Request::new_headers_only(Method::Get, "/get", Headers::new());
+        client.request(req, collector.new_stream_handler()).unwrap();
+    }
+
+    collector.wait_all();
+
+    // just checking here that responses are received for all of them. They should probably all be
+    // successful, though.
+}
+
+#[test]
 fn error_during_data_stream() {
     util::enable_logging();
 

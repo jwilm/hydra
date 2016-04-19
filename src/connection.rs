@@ -278,6 +278,7 @@ impl Connection {
         }
 
         let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
+        trace!("reregistering {:?} for {:?}", self.token, flags);
         Ok(try!(event_loop.reregister(self.stream(), self.token, flags, pollopt)))
     }
 
@@ -348,6 +349,17 @@ impl Connection {
             None => {
                 trace!("read WOULDBLOCK");
             },
+        }
+
+        // Reading data may allow for new streams to start. Give protocol a chance to write.
+        {
+            let conn_ref = Ref {
+                event_loop: event_loop,
+                token: self.token,
+                backlog: &mut self.backlog,
+                handler: &*self.handler,
+            };
+            try!(self.protocol.ready_write(conn_ref));
         }
 
         Ok(())

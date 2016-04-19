@@ -16,7 +16,7 @@ httparse = "*"
 # version = "0.4"
 # path = "../solicit"
 git = "https://github.com/jwilm/solicit"
-rev = "689ebed37b2e5a8e8d533bf05e5e7ae8c8c198ba"
+rev = "62a60dbc3c7a4a7de057870c3b33cfa08e1b77df"
 
 [features]
 tls = ["openssl"]

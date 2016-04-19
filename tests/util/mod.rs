@@ -126,6 +126,7 @@ impl<S: Collectable> ResponseCollector<S> {
             let msg = self.rx.recv().unwrap();
             self.counter -= 1;
             self.messages.push(msg);
+            println!("waiting for {} streams", self.counter);
         }
     }
 
@@ -200,7 +201,7 @@ impl request::Handler for HandlerStreamError {
 pub struct HeadersOnlyHandler {
     tx: mpsc::Sender<StreamMsg>,
     body: Vec<u8>,
-    response: Option<Response>
+    response: Option<Response>,
 }
 
 impl Collectable for HeadersOnlyHandler {
