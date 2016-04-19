@@ -141,7 +141,7 @@ pub trait StreamHandler: Send + fmt::Debug + 'static {
 pub trait Protocol: Sized + 'static {
     fn new() -> Self;
     fn on_data(&mut self, buf: &[u8], conn: connection::Ref) -> HttpResult<usize>;
-    fn ready_write(&mut self, conn: connection::Ref);
+    fn ready_write(&mut self, conn: connection::Ref) -> HttpResult<SendStatus>;
     fn notify(&mut self, msg: Msg, conn: connection::Ref) -> HttpResult<()>;
 }
 
@@ -545,7 +545,7 @@ impl Protocol for Http2 {
         Ok(total_consumed)
     }
 
-    fn ready_write(&mut self, mut conn: connection::Ref) {
+    fn ready_write(&mut self, mut conn: connection::Ref) -> HttpResult<SendStatus> {
         // TODO See about giving it only a reference to some parts of the connection
         // (perhaps conveniently wrapped in some helper wrapper) instead of the
         // full Conn. In fact, that is probably a must, as the protocol would like
@@ -555,7 +555,7 @@ impl Protocol for Http2 {
         // perhaps even asynchronously.
 
         let mut sender = SendDirect { conn: &mut conn };
-        self.send_next_data(&mut sender);
+        self.send_next_data(&mut sender)
     }
 
     fn notify(&mut self, msg: Msg, mut conn: connection::Ref) -> HttpResult<()> {
@@ -564,7 +564,7 @@ impl Protocol for Http2 {
         match msg {
             Msg::CreateStream(request, handler) => {
                 let stream = Http2::new_stream(request, handler, self.conn.scheme);
-                self.start_request(stream, &mut sender);
+                try!(self.start_request(stream, &mut sender));
             },
             Msg::Ping => {
                 try!(self.send_ping(&mut sender));

@@ -1,5 +1,5 @@
 //! Interactions with the I/O layer and the HTTP/2 state machine
-use std::io::{self, Cursor};
+use std::io::Cursor;
 use std::fmt;
 
 use mio::{self, EventSet, EventLoop, TryRead, TryWrite};
@@ -56,7 +56,8 @@ pub struct Ref<'a> {
 
 /// Handle for a connection usable from other threads
 ///
-/// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection.
+/// To get a ConnectionHandle, a user must create a Hydra instance and establish a connection. The
+/// connection handle is provided in the connection::Handler::on_connection method.
 #[derive(Debug, Clone)]
 pub struct Handle {
     // How many streams are currently active.
@@ -79,15 +80,21 @@ pub struct Handle {
     token: mio::Token,
 }
 
+/// Errors occurring when sending a message to the connection.
+pub type SendError<T> = mio::NotifyError<T>;
+pub type SendResult<T> = ::std::result::Result<(), SendError<T>>;
+
 impl Handle {
-    fn send(&self, msg: protocol::Msg) {
-        self.tx.send(worker::Msg::Protocol(self.token, msg));
+    /// Send a message to the worker's event loop
+    fn send(&self, msg: protocol::Msg) -> SendResult<worker::Msg> {
+        self.tx.send(worker::Msg::Protocol(self.token, msg))
     }
 
-    pub fn request<H>(&self, req: ::Request, handler: H)
+    /// Notify the connection to create a new request stream from `req` and `handler`
+    pub fn request<H>(&self, req: ::Request, handler: H) -> SendResult<worker::Msg>
         where H: protocol::StreamHandler
     {
-        self.send(protocol::Msg::CreateStream(req, Box::new(handler)));
+        self.send(protocol::Msg::CreateStream(req, Box::new(handler)))
     }
 }
 
@@ -189,23 +196,25 @@ impl Connection {
             try!(self.try_write(event_loop));
         }
 
-        self.reregister(event_loop);
+        // TODO handle error event
+
+        try!(self.reregister(event_loop));
 
         Ok(())
     }
 
-    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) {
+    fn reregister(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
         let mut flags = mio::EventSet::readable();
         if !self.backlog.is_empty() || self.protocol.wants_write() {
             flags = flags | mio::EventSet::writable();
         }
 
         let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
-        event_loop.reregister(self.stream(), self.token, flags, pollopt);
+        Ok(try!(event_loop.reregister(self.stream(), self.token, flags, pollopt)))
     }
 
-    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> io::Result<()> {
-        event_loop.deregister(self.stream())
+    pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> ConnectionResult<()> {
+        Ok(try!(event_loop.deregister(self.stream())))
     }
 
     pub fn notify(&mut self,
@@ -227,7 +236,7 @@ impl Connection {
         }
 
         // Reregister this connection on the event loop
-        self.reregister(event_loop);
+        try!(self.reregister(event_loop));
 
         Ok(())
     }
@@ -296,7 +305,7 @@ impl Connection {
                     backlog: &mut self.backlog,
                     handler: &*self.handler,
                 };
-                self.protocol.ready_write(conn_ref);
+                try!(self.protocol.ready_write(conn_ref));
             }
 
             // Flush whatever the protocol might have added...

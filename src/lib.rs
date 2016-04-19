@@ -48,20 +48,65 @@ pub struct PlaintextConnector;
 impl Connector for PlaintextConnector {}
 
 pub struct Config {
-    pub threads: u8,
-    pub connect_timeout_ms: u32,
+    pub connect_timeout_ms: u64,
     pub conns_per_thread: usize,
+    pub threads: u8,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
-            threads: 8,
             connect_timeout_ms: 60_000,
             conns_per_thread: 1_024,
+            threads: 8,
         }
     }
 }
+
+#[derive(Debug)]
+pub enum HydraError {
+    Io(io::Error),
+    Worker(worker::WorkerError),
+}
+
+impl ::std::error::Error for HydraError {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            HydraError::Io(ref err) => Some(err),
+            HydraError::Worker(ref err) => Some(err),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            HydraError::Io(_) => "encountered an I/O error",
+            HydraError::Worker(ref err) => err.description(),
+        }
+    }
+}
+
+impl ::std::fmt::Display for HydraError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            HydraError::Io(ref err) => write!(f, "Hydra encountered an I/O error: {}", err),
+            HydraError::Worker(ref err) => write!(f, "Hydra worker encountered error: {}", err),
+        }
+    }
+}
+
+impl From<worker::WorkerError> for HydraError {
+    fn from(val: worker::WorkerError) -> HydraError {
+        HydraError::Worker(val)
+    }
+}
+
+impl From<io::Error> for HydraError {
+    fn from(val: io::Error) -> HydraError {
+        HydraError::Io(val)
+    }
+}
+
+pub type Result<T> = ::std::result::Result<T, HydraError>;
 
 /// Interface to evented HTTP/2 client worker pool
 pub struct Hydra {
@@ -70,24 +115,24 @@ pub struct Hydra {
 }
 
 impl Hydra {
-    pub fn new(config: &Config) -> Hydra {
+    pub fn new(config: &Config) -> Result<Hydra> {
         info!("spawning a hydra");
 
         let mut workers = Vec::new();
         for _ in 0..config.threads {
-            workers.push(Worker::spawn(config));
+            workers.push(try!(Worker::spawn(config)));
         }
 
-        Hydra {
+        Ok(Hydra {
             workers: workers,
             next: AtomicUsize::new(0),
-        }
+        })
     }
 
     /// Connect to a host on plaintext transport
     ///
     /// FIXME U should be ToSocketAddrs
-    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> ConnectionResult<()>
+    pub fn connect<'a, U, H>(&'a self, addr: U, handler: H) -> Result<()>
         where U: ToSocketAddrs,
               H: ConnectionHandler,
     {
@@ -98,7 +143,7 @@ impl Hydra {
         let next = self.next.fetch_add(1, Ordering::SeqCst);
         let ref worker = self.workers[next % self.workers.len()];
 
-        worker.connect(stream, Box::new(handler));
+        try!(worker.connect(stream, Box::new(handler)));
 
         Ok(())
     }
@@ -178,6 +223,9 @@ pub enum ConnectionError {
 
     /// The worker is closing and a connection can not be created.
     WorkerClosing,
+
+    /// The worker has reached its capacity for connections
+    WorkerFull,
 }
 
 impl ::std::error::Error for ConnectionError {
@@ -195,6 +243,7 @@ impl ::std::error::Error for ConnectionError {
             ConnectionError::Http(ref err) => err.description(),
             ConnectionError::Timeout => "timeout when attempting to connect",
             ConnectionError::WorkerClosing => "worker isn't accepting new connections",
+            ConnectionError::WorkerFull => "worker cannot manage more connections",
         }
     }
 }
@@ -206,6 +255,7 @@ impl ::std::fmt::Display for ConnectionError {
             ConnectionError::Http(ref err) => write!(f, "HTTP/2 error on connection: {}", err),
             ConnectionError::Timeout => write!(f, "Timeout during connect"),
             ConnectionError::WorkerClosing => write!(f, "Worker not accepting new connections"),
+            ConnectionError::WorkerFull => write!(f, "Worker at connection capacity"),
         }
     }
 }

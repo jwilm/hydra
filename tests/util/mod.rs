@@ -22,15 +22,6 @@ pub enum StreamMsg {
     Response(BufferedResponse),
 }
 
-impl StreamMsg {
-    pub fn result(self) -> Result<BufferedResponse, ::hydra::RequestError> {
-        match self {
-            StreamMsg::Response(res) => Ok(res),
-            StreamMsg::Error(err) => Err(err),
-        }
-    }
-}
-
 /// Handles connection related events by implementing connection::Handler
 ///
 /// All events are sent on a channel.
