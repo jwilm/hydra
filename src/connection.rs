@@ -8,6 +8,65 @@ use protocol::{self, Protocol, Http2};
 use request;
 use worker::{self, Worker};
 
+pub trait NetworkStreamError : Send + Sync + ::std::error::Error + 'static { }
+
+impl NetworkStreamError for io::Error {}
+
+pub enum StreamStatus {
+    Bytes(usize),
+    WantRead,
+    WantWrite,
+    WouldBlock,
+    End,
+}
+
+type StreamResult<T, E> = ::std::result::Result<T, E>;
+
+pub trait NetworkStream : Send {
+    type Error: NetworkStreamError;
+
+    fn async_read(&mut self, buf: &mut [u8]) -> StreamResult<StreamStatus, Box<Self::Error>>;
+    fn async_write(&mut self, buf: &[u8]) -> StreamResult<StreamStatus, Box<Self::Error>>;
+    fn get_ref(&self) -> &mio::Evented;
+}
+
+struct PlaintextStream {
+    inner: mio::tcp::TcpStream,
+}
+
+impl PlaintextStream {
+    pub fn new(stream: mio::tcp::TcpStream) -> PlaintextStream {
+        PlaintextStream {
+            inner: stream
+        }
+    }
+}
+
+impl NetworkStream for PlaintextStream {
+    type Error = io::Error;
+
+    fn async_read(&mut self, buf: &mut[u8]) -> StreamResult<StreamStatus, Box<Self::Error>> {
+        match self.inner.try_read(buf) {
+            Ok(Some(0)) => Ok(StreamStatus::End),
+            Ok(Some(count)) => Ok(StreamStatus::Bytes(count)),
+            Ok(None) => Ok(StreamStatus::WouldBlock),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
+
+    fn async_write(&mut self, buf: &[u8]) -> StreamResult<StreamStatus, Box<Self::Error>> {
+        match self.inner.try_write(buf) {
+            Ok(Some(count)) => Ok(StreamStatus::Bytes(count)),
+            Ok(None) => Ok(StreamStatus::WouldBlock),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
+
+    fn get_ref(&self) -> &mio::Evented {
+        &self.inner as &mio::Evented
+    }
+}
+
 /// Type that receives events for a connection
 pub trait Handler: Send + fmt::Debug + 'static {
     fn on_connection(&self, Handle);
@@ -35,6 +94,9 @@ pub enum Error {
 
     /// The worker has reached its capacity for connections
     WorkerFull,
+
+    /// Network error
+    Stream(Box<NetworkStreamError>),
 }
 
 impl ::std::error::Error for Error {
@@ -42,6 +104,7 @@ impl ::std::error::Error for Error {
         match *self {
             Error::Io(ref err) => Some(err),
             Error::Http(ref err) => Some(err),
+            Error::Stream(ref err) => err.cause(),
             _ => None,
         }
     }
@@ -53,6 +116,7 @@ impl ::std::error::Error for Error {
             Error::Timeout => "timeout when attempting to connect",
             Error::WorkerClosing => "worker isn't accepting new connections",
             Error::WorkerFull => "worker cannot manage more connections",
+            Error::Stream(ref err) => err.description(),
         }
     }
 }
@@ -65,6 +129,7 @@ impl ::std::fmt::Display for Error {
             Error::Timeout => write!(f, "Timeout during connect"),
             Error::WorkerClosing => write!(f, "Worker not accepting new connections"),
             Error::WorkerFull => write!(f, "Worker at connection capacity"),
+            Error::Stream(ref err) => write!(f, "{}", err),
         }
     }
 }
@@ -81,6 +146,12 @@ impl From<::solicit::http::HttpError> for Error {
     }
 }
 
+impl<E: NetworkStreamError + 'static> From<Box<E>> for Error {
+    fn from(val: Box<E>) -> Error {
+        Error::Stream(val)
+    }
+}
+
 /// Connection result type
 pub type Result<T> = ::std::result::Result<T, Error>;
 
@@ -94,7 +165,7 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 /// The worker manages a set of connections using an event loop.
 pub struct Connection {
     token: mio::Token,
-    stream: mio::tcp::TcpStream,
+    stream: Box<NetworkStream<Error=NetworkStreamError>>,
     backlog: Vec<Cursor<Vec<u8>>>,
     is_writable: bool,
     protocol: Http2,
@@ -108,7 +179,7 @@ enum WriteStatus {
     Full,
 
     /// Wrote some of the bytes
-    Partial,
+    Partial(usize),
 
     /// Can't write, write would block
     WouldBlock,
@@ -220,7 +291,15 @@ impl Connection {
         self.handler.on_error(err);
     }
 
-    pub fn new(token: mio::Token, stream: mio::tcp::TcpStream, handler: Box<Handler>) -> Connection {
+    #[inline]
+    pub fn stream(&self) -> &mio::Evented {
+        self.stream.get_ref()
+    }
+
+    pub fn new(token: mio::Token,
+               stream: Box<NetworkStream<Error=NetworkStreamError>>,
+               handler: Box<Handler>) -> Connection
+    {
         trace!("Connection::new");
         Connection {
             token: token,
@@ -231,11 +310,6 @@ impl Connection {
             read_buf: Vec::with_capacity(4096),
             handler: handler,
         }
-    }
-
-    #[inline]
-    pub fn stream(&self) -> &mio::tcp::TcpStream {
-        &self.stream
     }
 
     pub fn initialize(&mut self, event_loop: &mut EventLoop<Worker>) {
@@ -279,11 +353,11 @@ impl Connection {
 
         let pollopt = mio::PollOpt::edge() | mio::PollOpt::oneshot();
         trace!("reregistering {:?} for {:?}", self.token, flags);
-        Ok(try!(event_loop.reregister(self.stream(), self.token, flags, pollopt)))
+        Ok(try!(event_loop.reregister(self.stream.get_ref(), self.token, flags, pollopt)))
     }
 
     pub fn deregister(&mut self, event_loop: &mut EventLoop<Worker>) -> Result<()> {
-        Ok(try!(event_loop.deregister(self.stream())))
+        Ok(try!(event_loop.deregister(self.stream.get_ref())))
     }
 
     pub fn notify(&mut self,
@@ -315,12 +389,13 @@ impl Connection {
         // exhaust the socket (since we're edge-triggered, we'd never get another
         // chance to read!)
         trace!("Handling read");
-        match try!(self.stream.try_read_buf(&mut self.read_buf)) {
-            Some(0) => {
+        match try!(self.stream.async_read(&mut self.read_buf)) {
+            StreamStatus::End => {
                 debug!("EOF");
                 // TODO EOF; should close connection and any remaining streams
+                unimplemented!();
             },
-            Some(n) => {
+            StreamStatus::Bytes(n) => {
                 debug!("read {} bytes", n);
                 let consumed = {
                     let conn_ref = Ref {
@@ -346,7 +421,7 @@ impl Connection {
 
                 trace!("Done.");
             },
-            None => {
+            _ => {
                 trace!("read WOULDBLOCK");
             },
         }
@@ -406,16 +481,18 @@ impl Connection {
             trace!("Trying a write from the backlog; items in backlog - {}", self.backlog.len());
             let status = {
                 let buf = &mut self.backlog[0];
-                match try!(self.stream.try_write_buf(buf)) {
-                    Some(_) if buf.get_ref().len() == buf.position() as usize => {
+                let pos = buf.position() as usize;
+                match try!(self.stream.async_write(&buf.get_ref()[pos..])) {
+                    StreamStatus::Bytes(_) if buf.get_ref().len() == buf.position() as usize => {
                         trace!("Full frame written!");
                         WriteStatus::Full
                     },
-                    Some(sz) => {
+                    StreamStatus::Bytes(sz) => {
                         trace!("Partial write: {} bytes", sz);
-                        WriteStatus::Partial
+                        buf.set_position((pos + sz) as u64);
+                        WriteStatus::Partial(sz)
                     },
-                    None => {
+                    _ => {
                         trace!("Write WOULDBLOCK");
                         WriteStatus::WouldBlock
                     },
@@ -427,7 +504,7 @@ impl Connection {
                     // for this type of thing...
                     self.backlog.remove(0);
                 },
-                WriteStatus::Partial => {},
+                WriteStatus::Partial(_) => {},
                 WriteStatus::WouldBlock => {
                     self.set_writable(false);
                     break;

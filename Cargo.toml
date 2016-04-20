@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 mio = "0.5"
-openssl = { version = "0.7.9", optional = true }
+openssl = { version = "0.7.9" }
 hyper = { version = "0.8", default-features = false }
 log = "*"
 httparse = "*"
@@ -17,9 +17,6 @@ httparse = "*"
 # path = "../solicit"
 git = "https://github.com/jwilm/solicit"
 rev = "62a60dbc3c7a4a7de057870c3b33cfa08e1b77df"
-
-[features]
-tls = ["openssl"]
 
 [dev-dependencies]
 env_logger = "*"

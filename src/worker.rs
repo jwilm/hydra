@@ -11,7 +11,7 @@ use mio::util::Slab;
 use mio::{self, Token, EventSet, EventLoop};
 
 use protocol::{self, Protocol};
-use connection::{self, Connection};
+use connection::{self, Connection, NetworkStreamError};
 use util::thread;
 
 /// Errors that may occur when interacting with a worker
@@ -166,10 +166,11 @@ impl Worker {
     ///
     /// A new `Connection` is created, the stream is registered with the event loop, and the
     /// connection is placed in the connections slab.
-    fn add_connection(&mut self,
-                      event_loop: &mut EventLoop<Worker>,
-                      stream: TcpStream,
-                      handler: Box<connection::Handler>)
+    fn add_connection<N>(&mut self,
+                         event_loop: &mut EventLoop<Worker>,
+                         stream: N,
+                         handler: Box<connection::Handler>)
+        where N: connection::NetworkStream<Error=connection::NetworkStreamError> + 'static,
     {
         // first check that there is room in the slab such that `insert_with` will succeed.
         if !self.connections.has_remaining() {
@@ -181,7 +182,7 @@ impl Worker {
         // should have guaranteed it.
         let token = self.connections.insert_with(|token| {
             // Create/initialize connection. The connection is returned so it's added to the slab.
-            let mut conn = Connection::new(token, stream, handler);
+            let mut conn = Connection::new(token, Box::new(stream), handler);
             conn.initialize(event_loop);
             conn
         }).expect("connections had remaining");
@@ -271,6 +272,7 @@ impl mio::Handler for Worker {
                 if self.closing {
                     handler.on_error(connection::Error::WorkerClosing);
                 } else {
+                    let stream = connection::PlaintextStream::new(stream);
                     self.add_connection(event_loop, stream, handler);
                 }
             },
